@@ -1,0 +1,53 @@
+name: verify-attachments
+
+on:
+  issues:
+    types: [opened, edited, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests Pillow
+
+      # ★ 旧来の "ZIP_URL を grep する" ステップは完全削除
+      #   → verify.py が Issue 本文から自力で抽出します
+
+      - name: Verify
+        id: verify
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          SIGNATURE_SALT: ${{ secrets.SIGNATURE_SALT }}
+        run: python verify.py
+
+      - name: Export outputs
+        if: always()
+        run: |
+          echo "VERIFICATION_RESULT=${{ steps.verify.outputs.verification_result }}" >> $GITHUB_ENV
+          echo "VERIFICATION_EXIT_CODE=${{ steps.verify.outputs.verification_exit_code }}" >> $GITHUB_ENV
+
+      - name: Finalize
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          VERIFICATION_RESULT: ${{ env.VERIFICATION_RESULT }}
+          VERIFICATION_EXIT_CODE: ${{ env.VERIFICATION_EXIT_CODE }}
+        run: python finalize_issue.py
