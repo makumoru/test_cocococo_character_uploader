@@ -50,6 +50,13 @@ def get_issue_body(repo: str, issue: str | int, token: str) -> str:
     data = r.json()
     return data.get("body") or ""
 
+def get_issue_labels(repo: str, issue: str | int, token: str) -> List[str]:
+    url = f"https://api.github.com/repos/{repo}/issues/{issue}"
+    r = requests.get(url, headers=_gh_headers(token), timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    return [label["name"] for label in (data.get("labels") or [])]
+
 def remove_label(repo: str, issue: str | int, token: str, label: str) -> None:
     url = f"https://api.github.com/repos/{repo}/issues/{issue}/labels/{requests.utils.quote(label, safe='')}"
     r = requests.delete(url, headers=_gh_headers(token), timeout=15)
@@ -380,15 +387,19 @@ def main() -> int:
             verify_images_if_needed(extract_root, relpath)
 
         # 成功処理
-        add_labels(repo, issue_number, github_token, ["Verified ✅"])
-        try:
-            remove_label(repo, issue_number, github_token, "Invalid ❌")
-        except Exception as e2:
-            print(f"[warn] Invalidラベル削除に失敗: {e2}")
-        try:
-            remove_label(repo, issue_number, github_token, "pending")
-        except Exception as e2:
-            print(f"[warn] pendingラベル削除に失敗: {e2}")
+        # 1. 既存のラベルを取得
+        current_labels = get_issue_labels(repo, issue_number, github_token)
+        
+        # 2. setに変換して操作しやすくする
+        new_labels = set(current_labels)
+        
+        # 3. 不要なラベルを削除し、必要なラベルを追加
+        new_labels.discard("pending")
+        new_labels.discard("Invalid ❌")
+        new_labels.add("Verified ✅")
+        
+        # 4. 新しいラベルリストでIssueを更新 (add_labelsは実質set_labelsとして機能)
+        add_labels(repo, issue_number, github_token, list(new_labels))
 
         post_comment(repo, issue_number, github_token,
                      "検証成功: 署名・マニフェスト完全一致・添付ポリシーの整合性を確認しました。")
