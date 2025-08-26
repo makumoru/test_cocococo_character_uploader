@@ -12,6 +12,7 @@ from urllib.parse import urlparse, unquote
 from typing import List, Dict, Optional
 
 import requests
+import configparser
 from PIL import Image
 
 # ===== 定数 =====
@@ -49,13 +50,6 @@ def get_issue_body(repo: str, issue: str | int, token: str) -> str:
     r.raise_for_status()
     data = r.json()
     return data.get("body") or ""
-
-def get_issue_labels(repo: str, issue: str | int, token: str) -> List[str]:
-    url = f"https://api.github.com/repos/{repo}/issues/{issue}"
-    r = requests.get(url, headers=_gh_headers(token), timeout=15)
-    r.raise_for_status()
-    data = r.json()
-    return [label["name"] for label in (data.get("labels") or [])]
 
 def remove_label(repo: str, issue: str | int, token: str, label: str) -> None:
     url = f"https://api.github.com/repos/{repo}/issues/{issue}/labels/{requests.utils.quote(label, safe='')}"
@@ -386,20 +380,49 @@ def main() -> int:
                 raise ValueError(f"ハッシュ不一致: {pretty_name(relpath)}")
             verify_images_if_needed(extract_root, relpath)
 
+        # character.ini を読んで派生/NSFWラベルを自動付与
+        try:
+            ini_rel = None
+            for rp in manifest_paths:
+                if rp.lower().endswith("character.ini"):
+                    ini_rel = rp
+                    break
+            if ini_rel:
+                ini_path = (extract_root / ini_rel).resolve()
+                # 読み込み（INI内の奇妙なUnicodeも許容）
+                cp = configparser.ConfigParser()
+                with open(ini_path, "r", encoding="utf-8", errors="ignore") as f:
+                    cp.read_file(f)
+                nsfw = False
+                derivative = False
+                if cp.has_section("INFO"):
+                    # 文字列の大小無視で true を判定
+                    getv = lambda k: (cp.get("INFO", k, fallback="false") or "").strip().lower()
+                    nsfw = getv("IS_NSFW") in ("1","true","yes","on")
+                    derivative = getv("IS_DERIVATIVE") in ("1","true","yes","on")
+                labels_to_add = []
+                if nsfw:
+                    labels_to_add.append("nsfw")
+                if derivative:
+                    labels_to_add.append("derivative-work")
+                if labels_to_add:
+                    try:
+                        add_labels(repo, issue_number, github_token, labels_to_add)
+                    except Exception as e2:
+                        print(f"[warn] ラベル付与に失敗: {labels_to_add}: {e2}")
+        except Exception as e:
+            print(f"[warn] character.ini の解析に失敗: {e}")
+
         # 成功処理
-        # 1. 既存のラベルを取得
-        current_labels = get_issue_labels(repo, issue_number, github_token)
-        
-        # 2. setに変換して操作しやすくする
-        new_labels = set(current_labels)
-        
-        # 3. 不要なラベルを削除し、必要なラベルを追加
-        new_labels.discard("pending")
-        new_labels.discard("Invalid ❌")
-        new_labels.add("Verified ✅")
-        
-        # 4. 新しいラベルリストでIssueを更新 (add_labelsは実質set_labelsとして機能)
-        add_labels(repo, issue_number, github_token, list(new_labels))
+        add_labels(repo, issue_number, github_token, ["Verified ✅"])
+        try:
+            remove_label(repo, issue_number, github_token, "Invalid ❌")
+        except Exception as e2:
+            print(f"[warn] Invalidラベル削除に失敗: {e2}")
+        try:
+            remove_label(repo, issue_number, github_token, "pending")
+        except Exception as e2:
+            print(f"[warn] pendingラベル削除に失敗: {e2}")
 
         post_comment(repo, issue_number, github_token,
                      "検証成功: 署名・マニフェスト完全一致・添付ポリシーの整合性を確認しました。")
