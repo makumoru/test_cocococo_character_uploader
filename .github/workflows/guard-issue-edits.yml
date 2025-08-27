@@ -1,0 +1,188 @@
+name: Guard issue edits
+
+on:
+  issues:
+    types:
+      # 直接編集
+      - edited
+      # メタ変更（運用で「編集」に含めたいもの）
+      - labeled
+      - unlabeled
+      - assigned
+      - unassigned
+      - milestoned
+      - demilestoned
+
+permissions:
+  contents: read
+  issues: write
+  actions: read
+  # （公開/組織設定によっては不要だが、コラボレータ権限確認のために read 権限を確保）
+  # members: read
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reject unauthorized edits
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo  = context.repo.repo;
+            const issue_number = context.payload.issue.number;
+
+            const actor       = context.payload.sender?.login;
+            const issueAuthor = context.payload.issue?.user?.login;
+            const action      = context.payload.action;
+
+            // 1) 許可判定
+            const isBot   = actor === 'github-actions[bot]';
+
+            let isAdmin = false;
+            try {
+              const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+                owner, repo, username: actor
+              });
+              // admin のみ許可（maintain/write は不可）
+              isAdmin = data?.permission === 'admin';
+            } catch (e) {
+              // 非コラボレータの場合など。ここでは単純に admin=false 扱い
+              isAdmin = false;
+            }
+
+            const allowed = (actor === issueAuthor) || isBot || isAdmin;
+
+            // 2) 許可なら何もしない
+            if (allowed) {
+              core.info(`Allowed editor: ${actor}`);
+              return;
+            }
+
+            // 3) 不許可：差し戻し
+            core.info(`Rejecting edit by ${actor} (not author/bot/admin). Action=${action}`);
+
+            // 差し戻し理由のコメント
+            const reason = [
+              `@${actor} さんのこの変更は拒否されました。`,
+              `許可される編集者: Issue作者 / github-actions[bot] / リポジトリ管理者 (admin)`,
+            ].join('\n');
+
+            // 変更の種類ごとに巻き戻す
+            if (action === 'edited') {
+              const changes = context.payload.changes || {};
+
+              // title
+              if (changes.title?.from !== undefined) {
+                await github.rest.issues.update({
+                  owner, repo, issue_number,
+                  title: changes.title.from
+                });
+              }
+
+              // body
+              if (changes.body?.from !== undefined) {
+                await github.rest.issues.update({
+                  owner, repo, issue_number,
+                  body: changes.body.from
+                });
+              }
+
+              // state 変更があれば（rare）
+              if (changes.state?.from !== undefined) {
+                await github.rest.issues.update({
+                  owner, repo, issue_number,
+                  state: changes.state.from
+                });
+              }
+
+              await github.rest.issues.createComment({ owner, repo, issue_number, body: reason });
+              return;
+            }
+
+            if (action === 'labeled') {
+              const label = context.payload.label?.name;
+              if (label) {
+                // 不正に付けられたラベルを剥がす
+                try {
+                  await github.rest.issues.removeLabel({ owner, repo, issue_number, name: label });
+                } catch (e) {
+                  core.warning(`Failed to remove label ${label}: ${e.message}`);
+                }
+              }
+              await github.rest.issues.createComment({ owner, repo, issue_number, body: reason });
+              return;
+            }
+
+            if (action === 'unlabeled') {
+              const label = context.payload.label?.name;
+              if (label) {
+                // 不正に外されたラベルを戻す
+                try {
+                  await github.rest.issues.addLabels({ owner, repo, issue_number, labels: [label] });
+                } catch (e) {
+                  core.warning(`Failed to re-add label ${label}: ${e.message}`);
+                }
+              }
+              await github.rest.issues.createComment({ owner, repo, issue_number, body: reason });
+              return;
+            }
+
+            if (action === 'assigned') {
+              const assignee = context.payload.assignee?.login;
+              if (assignee) {
+                // 不正に追加された担当者を外す
+                try {
+                  await github.rest.issues.removeAssignees({ owner, repo, issue_number, assignees: [assignee] });
+                } catch (e) {
+                  core.warning(`Failed to remove assignee ${assignee}: ${e.message}`);
+                }
+              }
+              await github.rest.issues.createComment({ owner, repo, issue_number, body: reason });
+              return;
+            }
+
+            if (action === 'unassigned') {
+              const assignee = context.payload.assignee?.login;
+              if (assignee) {
+                // 不正に外された担当者を戻す
+                try {
+                  await github.rest.issues.addAssignees({ owner, repo, issue_number, assignees: [assignee] });
+                } catch (e) {
+                  core.warning(`Failed to re-add assignee ${assignee}: ${e.message}`);
+                }
+              }
+              await github.rest.issues.createComment({ owner, repo, issue_number, body: reason });
+              return;
+            }
+
+            if (action === 'milestoned') {
+              const ms = context.payload.milestone;
+              if (ms) {
+                // 不正に付けられたマイルストーンを外す
+                try {
+                  await github.rest.issues.update({ owner, repo, issue_number, milestone: null });
+                } catch (e) {
+                  core.warning(`Failed to remove milestone: ${e.message}`);
+                }
+              }
+              await github.rest.issues.createComment({ owner, repo, issue_number, body: reason });
+              return;
+            }
+
+            if (action === 'demilestoned') {
+              const ms = context.payload.milestone;
+              if (ms) {
+                // 不正に外されたマイルストーンを戻す
+                try {
+                  await github.rest.issues.update({ owner, repo, issue_number, milestone: ms.number });
+                } catch (e) {
+                  core.warning(`Failed to restore milestone: ${e.message}`);
+                }
+              }
+              await github.rest.issues.createComment({ owner, repo, issue_number, body: reason });
+              return;
+            }
+
+            // その他が来たら通知のみ
+            await github.rest.issues.createComment({ owner, repo, issue_number, body: reason });
