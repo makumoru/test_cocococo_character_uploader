@@ -1,3 +1,4 @@
+# .github/workflows/sync_attachments_from_comments.yml
 name: Sync attachments from author comments
 
 on:
@@ -29,4 +30,4 @@ jobs:
       - name: Run sync script
         env:
           GITHUB_EVENT_PATH: ${{ github.event_path }}
-        run: python .github/sync_comment_attachments.py
+        run: python sync_comment_attachments.py
