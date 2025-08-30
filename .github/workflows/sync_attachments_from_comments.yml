@@ -29,4 +29,4 @@ jobs:
       - name: Run sync script
         env:
           GITHUB_EVENT_PATH: ${{ github.event_path }}
-        run: python .github/scripts/sync_comment_attachments.py
+        run: python .github/sync_comment_attachments.py
