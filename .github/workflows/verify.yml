@@ -1,0 +1,35 @@
+name: verify
+
+on:
+  issues:
+    types: [opened, edited, reopened]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: |
+          python -m pip install --upgrade pip
+          pip install requests Pillow
+      - name: Run verify
+        run: python verify.py
+      - name: Export outputs for finalize
+        if: always()
+        run: |
+          echo "VERIFICATION_RESULT=${VERIFICATION_RESULT:-failure}" >> $GITHUB_ENV
+          echo "VERIFICATION_EXIT_CODE=${VERIFICATION_EXIT_CODE:-1}" >> $GITHUB_ENV
+      - name: Finalize
+        if: always()
+        run: python finalize_issue.py
