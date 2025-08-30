@@ -19,15 +19,33 @@ jobs:
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GITHUB_REPOSITORY: ${{ github.repository }}
+      ISSUE_NUMBER: ${{ github.event.issue.number }}   # ← verify用にここで渡す
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: |
+
+      - name: Install deps
+        run: |
           python -m pip install --upgrade pip
-          pip install requests
-      - name: Run sync script
+          pip install requests Pillow
+
+      - name: Run sync script (move attachments to body)
         env:
           GITHUB_EVENT_PATH: ${{ github.event_path }}
         run: python sync_comment_attachments.py
+
+      # ここから追加：本文が整った直後に検証を実行
+      - name: Run verify
+        run: python verify.py
+
+      - name: Export outputs for finalize
+        if: always()
+        run: |
+          echo "VERIFICATION_RESULT=${VERIFICATION_RESULT:-failure}" >> $GITHUB_ENV
+          echo "VERIFICATION_EXIT_CODE=${VERIFICATION_EXIT_CODE:-1}" >> $GITHUB_ENV
+
+      - name: Finalize issue
+        if: always()
+        run: python finalize_issue.py
