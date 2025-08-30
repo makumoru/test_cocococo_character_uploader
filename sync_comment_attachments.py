@@ -3,26 +3,22 @@ import json
 import os
 import re
 import sys
-import textwrap
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 import requests
+from urllib.parse import urlparse
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "attachment-sync/1.0"})
+SESSION.headers.update({"User-Agent": "attachment-sync/1.1"})
 TIMEOUT = (5, 15)  # connect, read
 
-UA_DOMAIN = r"https?://github\.com/user-attachments/(?:files|assets)/[^\s\)\]]+"
-UA_URL_RE = re.compile(UA_DOMAIN)
-
-# Markdown forms that might wrap a URL
-MD_IMAGE_RE_TMPL = r"!\[[^\]]*\]\(\s*{url}\s*\)"
-MD_LINK_RE_TMPL  = r"\[[^\]]*\]\(\s*{url}\s*\)"
+# user-attachments の URL を素直に拾う（Markdown 内でも生でもヒットする）
+UA_URL_RE = re.compile(r"https?://github\.com/user-attachments/(?:files|assets)/[^\s\)\]]+")
 
 PNG_CT = {"image/png"}
 ZIP_CT = {
     "application/zip",
     "application/x-zip-compressed",
-    "application/octet-stream",  # sometimes used for zip
+    "application/octet-stream",  # ZIP がこれで返ることがある
 }
 
 GH_API = "https://api.github.com"
@@ -41,45 +37,67 @@ def event_payload() -> Dict:
         return json.load(f)
 
 
-def classify_url(url: str) -> str:
+def _guess_name_from_url(url: str) -> str:
+    # URL 末尾のパス名を雑に拾う（assets の場合は UUID で無意味なことが多い）
+    p = urlparse(url)
+    tail = os.path.basename(p.path)
+    return tail or "attachment"
+
+
+def _parse_content_disposition(cd: str) -> Optional[str]:
+    # filename*=UTF-8''... を優先、次に filename="..."/filename=...
+    if not cd:
+        return None
+    m = re.search(r"filename\*\s*=\s*UTF-8''([^;]+)", cd)
+    if m:
+        return m.group(1)
+    m = re.search(r'filename\s*=\s*"([^"]+)"', cd)
+    if m:
+        return m.group(1)
+    m = re.search(r"filename\s*=\s*([^;]+)", cd)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+def classify_and_name(url: str) -> Tuple[str, Optional[str]]:
     """
-    HEAD (fallback to GET stream) and classify by Content-Type / filename.
-    Returns "png" / "zip" / "other".
+    URL を HEAD（失敗時 GET(stream)）し、種別と表示名を返す。
+    戻り値: ("png"|"zip"|"other", filename or None)
     """
     try:
-        # Prefer HEAD; some endpoints may not allow -> then fall back to GET(stream=True)
         r = SESSION.head(url, allow_redirects=True, timeout=TIMEOUT)
         if r.status_code >= 400 or not r.headers:
             r = SESSION.get(url, stream=True, allow_redirects=True, timeout=TIMEOUT)
-        ct = r.headers.get("Content-Type", "").split(";")[0].strip().lower()
-        cd = r.headers.get("Content-Disposition", "")
-        # crude filename sniff
-        filename = ""
-        m = re.search(r'filename\*=UTF-8\'\'([^;]+)', cd) or re.search(r'filename="?([^";]+)"?', cd)
-        if m:
-            filename = m.group(1)
-        # decide
-        if ct in PNG_CT or url.lower().endswith(".png") or filename.lower().endswith(".png"):
-            return "png"
-        if (ct in ZIP_CT and (url.lower().endswith(".zip") or filename.lower().endswith(".zip"))) or url.lower().endswith(".zip"):
-            return "zip"
-        # A few user-attachments for PNG/ZIP may come with octet-stream + opaque asset URL (no ext).
+        ct = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        cd = r.headers.get("Content-Disposition") or ""
+        name = _parse_content_disposition(cd) or _guess_name_from_url(url)
+
+        # 分類
+        low_url = url.lower()
+        low_name = name.lower() if name else ""
+        if ct in PNG_CT or low_url.endswith(".png") or low_name.endswith(".png"):
+            return "png", name
+        if (
+            ct in ZIP_CT
+            and (low_url.endswith(".zip") or low_name.endswith(".zip") or "assets" in low_url)
+        ) or low_url.endswith(".zip"):
+            return "zip", name
+        # user-attachments では octet-stream + assets/UUID で拡張子不明なことがある
         if ct in PNG_CT:
-            return "png"
-        if ct in ZIP_CT and (filename.lower().endswith(".zip") or not filename):
-            return "zip"
-        return "other"
+            return "png", name
+        if ct in ZIP_CT:
+            return "zip", name
+        return "other", name
     except Exception as e:
         debug(f"HEAD/GET failed for {url}: {e}")
-        return "other"
+        return "other", None
 
 
 def extract_ua_urls(text: str) -> List[str]:
     if not text:
         return []
-    # Find raw URLs. Markdown wrappers are handled when removing.
     urls = UA_URL_RE.findall(text)
-    # Deduplicate preserving order
     seen, out = set(), []
     for u in urls:
         if u not in seen:
@@ -89,35 +107,41 @@ def extract_ua_urls(text: str) -> List[str]:
 
 
 def remove_urls_from_body(body: str, urls_to_remove: List[str]) -> str:
+    """本文から対象 URL（生/リンク/画像）を安全に除去"""
     if not body or not urls_to_remove:
         return body or ""
 
     new_body = body
     for url in urls_to_remove:
-        # Remove markdown image/link that contains the URL
-        img_pat = re.compile(MD_IMAGE_RE_TMPL.format(url=re.escape(url)))
-        lnk_pat = re.compile(MD_LINK_RE_TMPL.format(url=re.escape(url)))
-
-        before = new_body
+        # ![]() と []() の両方を除去
+        img_pat = re.compile(rf"!\[[^\]]*\]\(\s*{re.escape(url)}\s*\)")
+        lnk_pat = re.compile(rf"\[[^\]]*\]\(\s*{re.escape(url)}\s*\)")
         new_body = img_pat.sub("", new_body)
         new_body = lnk_pat.sub("", new_body)
-        # Remove bare URL occurrences
+        # 生 URL も除去
         new_body = re.sub(re.escape(url), "", new_body)
 
-        # Clean leftover extra blank lines from removed blocks
-        new_body = re.sub(r"\n{3,}", "\n\n", new_body).strip()
+    # 余分な空行を整える
+    new_body = re.sub(r"\n{3,}", "\n\n", new_body).strip()
+    return new_body
 
-    return new_body.strip()
 
+def build_insertion_block(pngs: List[Tuple[str, Optional[str]]],
+                          zips: List[Tuple[str, Optional[str]]]) -> str:
+    """PNG を画像として、ZIP を [名前](URL) で出力。順序は PNG → ZIP。"""
+    lines: List[str] = []
 
-def build_insertion_block(pngs: List[str], zips: List[str]) -> str:
-    lines = []
-    # PNG first (each as an image)
-    for p in pngs:
-        lines.append(f"![thumbnail]({p})")
-    # ZIPs next (raw URLs; minimal formatting)
-    for z in zips:
-        lines.append(z)
+    # PNG（画像埋め込み）。alt は固定で "thumbnail"
+    for url, _name in pngs:
+        lines.append(f"![thumbnail]({url})")
+
+    # ZIP（リンク）。表示名はヘッダ由来のファイル名があればそれを使う。
+    for url, name in zips:
+        display = name or _guess_name_from_url(url)
+        # 余計なクォートや周辺空白を掃除
+        display = display.strip().strip('"').strip("'")
+        lines.append(f"[{display}]({url})")
+
     return "\n".join(lines).strip()
 
 
@@ -136,47 +160,45 @@ def main():
         debug("Missing GITHUB_TOKEN / GITHUB_REPOSITORY / issue_number; exit.")
         sys.exit(0)
 
-    # Only proceed if the comment actually contains user-attachments links
+    # コメントから user-attachments URL を抽出
     comment_urls = extract_ua_urls(comment_body)
     if not comment_urls:
         debug("No user-attachments URLs in this comment; nothing to do.")
         sys.exit(0)
 
-    # Classify URLs in the *comment* (source of truth to move)
-    pngs, zips = [], []
+    # 分類 + ファイル名解決
+    pngs: List[Tuple[str, Optional[str]]] = []
+    zips: List[Tuple[str, Optional[str]]] = []
     for url in comment_urls:
-        kind = classify_url(url)
+        kind, name = classify_and_name(url)
         if kind == "png":
-            pngs.append(url)
+            pngs.append((url, name))
         elif kind == "zip":
-            zips.append(url)
+            zips.append((url, name))
 
     if not pngs and not zips:
         debug("No PNG/ZIP in the comment; nothing to move.")
         sys.exit(0)
 
-    # From the current issue body, remove existing PNG/ZIP user-attachments links
+    # 本文から既存の PNG/ZIP の user-attachments を除去
     body_urls = extract_ua_urls(issue_body)
     body_png_zip = []
     for url in body_urls:
-        kind = classify_url(url)
+        kind, _ = classify_and_name(url)
         if kind in ("png", "zip"):
             body_png_zip.append(url)
 
     cleaned_body = remove_urls_from_body(issue_body, body_png_zip)
 
+    # 先頭に PNG→ZIP を挿入（ZIP は [名前](URL) 形式）
     insertion = build_insertion_block(pngs, zips)
-    if insertion:
-        new_body = (insertion + "\n\n" + cleaned_body).strip()
-    else:
-        new_body = cleaned_body
+    new_body = (insertion + "\n\n" + cleaned_body).strip() if insertion else cleaned_body
 
-    # Avoid useless PATCH if unchanged
     if new_body.strip() == issue_body.strip():
         debug("Body unchanged; skipping PATCH.")
         sys.exit(0)
 
-    # PATCH issue body
+    # Issue 本文を更新
     url = f"{GH_API}/repos/{repo}/issues/{issue_number}"
     resp = SESSION.patch(
         url,
@@ -186,7 +208,6 @@ def main():
     )
     if resp.status_code >= 300:
         debug(f"Failed to update issue body: {resp.status_code} {resp.text}")
-        # Exit non-zero so the job shows as failed; your call
         sys.exit(1)
 
     debug("Issue body updated successfully.")
