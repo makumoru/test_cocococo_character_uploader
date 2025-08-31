@@ -21,6 +21,8 @@ MAX_PNG_SIZE_BYTES = 10 * 1024 * 1024
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp"}
 ALLOWED_ROOT_FILES = {"character.ini", "readme.txt", "signature.json"}  # 仕様メモ
 
+MARKER_RE = re.compile(r"<!--\s*attachments-normalized:sha256=([0-9a-f]{64})\s*-->")
+
 # ===== GitHub API =====
 def _gh_headers(token: str) -> dict:
     return {
@@ -44,12 +46,39 @@ def close_issue(repo: str, issue: str | int, token: str) -> None:
     r = requests.patch(url, json={"state": "closed"}, headers=_gh_headers(token), timeout=15)
     r.raise_for_status()
 
-def get_issue_body(repo: str, issue: str | int, token: str) -> str:
-    url = f"https://api.github.com/repos/{repo}/issues/{issue}"
-    r = requests.get(url, headers=_gh_headers(token), timeout=15)
+def get_issue_body(token, repo, number):
+    r = requests.get(
+        f"https://api.github.com/repos/{repo}/issues/{number}",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+        timeout=(5, 15),
+    )
     r.raise_for_status()
-    data = r.json()
-    return data.get("body") or ""
+    return (r.json().get("body") or "")
+
+def comment(token, repo, number, body):
+    requests.post(
+        f"https://api.github.com/repos/{repo}/issues/{number}/comments",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+        json={"body": body},
+        timeout=(5, 15),
+    )
+
+def main_gate_latest_only():
+    token  = os.environ["GITHUB_TOKEN"]
+    repo   = os.environ["GITHUB_REPOSITORY"]
+    number = int(os.environ["ISSUE_NUMBER"])
+    want_hash = os.environ.get("NORMALIZED_HASH", "")
+
+    body = get_issue_body(token, repo, number)
+    m = MARKER_RE.search(body)
+    if want_hash and m and m.group(1).lower() != want_hash.lower():
+        # 自分は古い正規化結果に属する → スキップ
+        comment(token, repo, number,
+                f"> Skipped stale verification (newer normalization detected: `{m.group(1)[:8]}...` ≠ `{want_hash[:8]}...`).")
+        # 出力は success/exit0 で返し、finalizeに影響させない
+        print("verification_result=skipped", file=sys.stdout)
+        print("verification_exit_code=0", file=sys.stdout)
+        sys.exit(0)
 
 def remove_label(repo: str, issue: str | int, token: str, label: str) -> None:
     url = f"https://api.github.com/repos/{repo}/issues/{issue}/labels/{requests.utils.quote(label, safe='')}"
@@ -461,4 +490,5 @@ def main() -> int:
         return 1
 
 if __name__ == "__main__":
+    main_gate_latest_only()
     sys.exit(main())
