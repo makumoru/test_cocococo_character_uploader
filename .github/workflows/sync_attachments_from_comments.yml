@@ -1,20 +1,20 @@
-name: Sync attachments from comments/body and dispatch verify
+# .github/workflows/sync_attachments_from_comments.yml
+name: Sync attachments from author comments
 
 on:
   issue_comment:
     types: [created, edited]
-  issues:
-    types: [edited]
 
 permissions:
-  contents: write
+  contents: read
   issues: write
 
 jobs:
   sync:
     if: >
-      (github.event_name == 'issue_comment') ||
-      (github.event_name == 'issues' && github.event.action == 'edited' && github.event.changes.body != null)
+      github.event.issue != null &&
+      github.event.comment != null &&
+      github.event.issue.user.login == github.event.comment.user.login
     runs-on: ubuntu-latest
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -27,21 +27,7 @@ jobs:
       - run: |
           python -m pip install --upgrade pip
           pip install requests
-      - id: normalize
-        name: Normalize attachments at top of issue body
+      - name: Run sync script
         env:
           GITHUB_EVENT_PATH: ${{ github.event_path }}
-          GITHUB_EVENT_NAME: ${{ github.event_name }}
         run: python sync_comment_attachments.py
-
-      - name: Repository dispatch to trigger verify (only if changed)
-        if: steps.normalize.outputs.normalized == 'changed'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          ISSUE=${{ steps.normalize.outputs.issue_number }}
-          HASH=${{ steps.normalize.outputs.normalized_hash }}
-          api="https://api.github.com/repos/${{ github.repository }}/dispatches"
-          payload=$(jq -n --arg n "$ISSUE" --arg h "$HASH" '{event_type:"attachments-normalized", client_payload:{issue_number:($n|tonumber), normalized_hash:$h}}')
-          curl -sS -X POST -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
-               "$api" -d "$payload"
