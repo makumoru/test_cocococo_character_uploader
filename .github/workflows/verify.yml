@@ -21,15 +21,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: |
-          python -m pip install --upgrade pip
-          pip install requests pillow
       - id: runverify
         name: Run verify
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          ISSUE_NUMBER: ${{ github.event.client_payload.issue_number }}
+          GITHUB_REPOSITORY: ${{ github.repository }}              # ← これが owner/repo
+          ISSUE_NUMBER: ${{ github.event.client_payload.issue_number }}   # ← これが 30 等の数値
           SIGNATURE_SALT: ${{ secrets.SIGNATURE_SALT }}
           NORMALIZED_HASH: ${{ github.event.client_payload.normalized_hash }}
         run: python verify.py
