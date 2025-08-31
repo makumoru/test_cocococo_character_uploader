@@ -3,12 +3,13 @@ name: Verify attachment bundle
 on:
   repository_dispatch:
     types: [attachments-normalized]
-  workflow_dispatch: {}
+  workflow_dispatch: {}   # 手動再検証したいとき用
 
 permissions:
   contents: read
   issues: write
 
+# 同一Issue＋ハッシュの併走を禁止。新しい世代が来たら古いのは自動キャンセル。
 concurrency:
   group: verify-${{ github.event.client_payload.issue_number || github.event.inputs.issue_number }}-${{ github.event.client_payload.normalized_hash || 'manual' }}
   cancel-in-progress: true
@@ -16,26 +17,35 @@ concurrency:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    env:
+      GITHUB_REPOSITORY: ${{ github.repository }}
+      ISSUE_NUMBER: ${{ github.event.client_payload.issue_number }}
+      NORMALIZED_HASH: ${{ github.event.client_payload.normalized_hash }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pillow
       - id: runverify
         name: Run verify
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}              # ← これが owner/repo
-          ISSUE_NUMBER: ${{ github.event.client_payload.issue_number }}   # ← これが 30 等の数値
           SIGNATURE_SALT: ${{ secrets.SIGNATURE_SALT }}
-          NORMALIZED_HASH: ${{ github.event.client_payload.normalized_hash }}
-        run: python verify.py
-
+          GITHUB_REPOSITORY: ${{ env.GITHUB_REPOSITORY }}
+          ISSUE_NUMBER: ${{ env.ISSUE_NUMBER }}
+          NORMALIZED_HASH: ${{ env.NORMALIZED_HASH }}
+        run: |
+          python verify.py
       - name: Finalize
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          ISSUE_NUMBER: ${{ github.event.client_payload.issue_number }}
+          GITHUB_REPOSITORY: ${{ env.GITHUB_REPOSITORY }}
+          ISSUE_NUMBER: ${{ env.ISSUE_NUMBER }}
           VERIFICATION_RESULT: ${{ steps.runverify.outputs.verification_result }}
           VERIFICATION_EXIT_CODE: ${{ steps.runverify.outputs.verification_exit_code }}
-        run: python finalize_issue.py
+        run: |
+          python finalize_issue.py
