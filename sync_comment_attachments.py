@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
-import json, os, re, sys, hashlib
+# coding: utf-8
+import json
+import os
+import re
+import sys
+import hashlib
 from typing import List, Tuple, Dict, Optional
 from urllib.parse import urlparse
+
 import requests
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "attachment-sync/1.4"})
+SESSION.headers.update({"User-Agent": "attachment-sync/1.5"})
 TIMEOUT = (5, 15)
 
+# user-attachments URL（assets / files の両系統）
 UA_URL = r"https?://github\.com/user-attachments/(?:files|assets)/[^\s\)\]\"'>]+"
 UA_URL_RE = re.compile(UA_URL)
 
-# 直貼りの各構文
+# 本文・コメント内の構文
 MD_LINK_MAP_RE  = re.compile(rf"\[([^\]]+)\]\(\s*({UA_URL})\s*\)")
 MD_IMAGE_MAP_RE = re.compile(rf"!\[([^\]]*)\]\(\s*({UA_URL})\s*\)")
 HTML_IMG_TAG_RE = re.compile(
@@ -24,33 +31,56 @@ ZIP_CT = {"application/zip", "application/x-zip-compressed", "application/octet-
 
 GH_API = "https://api.github.com"
 
-def debug(msg: str): print(f"[sync] {msg}", file=sys.stderr)
+# 先頭ブロックの世代印（＝最新性を検証側と共有）
+MARKER_PREFIX = "<!-- attachments-normalized:sha256="
+MARKER_RE = re.compile(r"<!--\s*attachments-normalized:sha256=([0-9a-f]{64})\s*-->")
+
+# 旧ブロックを**先頭から丸ごと**削除するための強いパターン
+ATTACH_BLOCK_HEAD_RE = re.compile(
+    r"""^(
+        (?:[ \t]*(?:<img\b[^>]*\bsrc=['"]""" + UA_URL + r"""['"][^>]*>)[ \t]*\r?\n)+
+        (?:\r?\n)?
+        (?:[ \t]*\[[^\]]+\]\(\s*""" + UA_URL + r"""\s*\)[ \t]*\r?\n)+
+        [ \t]*<!--\s*attachments-normalized:sha256=[0-9a-f]{64}\s*-->\s*\r?\n
+    )""",
+    re.IGNORECASE | re.MULTILINE | re.VERBOSE
+)
+
+def debug(msg: str):
+    print(f"[sync] {msg}", file=sys.stderr)
 
 def load_event(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as f: return json.load(f)
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 def guess_name_from_url(url: str) -> str:
     tail = os.path.basename(urlparse(url).path)
     return tail or "attachment.zip"
 
 def parse_cd(cd: Optional[str]) -> Optional[str]:
-    if not cd: return None
+    if not cd:
+        return None
     m = re.search(r"filename\*\s*=\s*UTF-8''([^;]+)", cd)
-    if m: return m.group(1)
+    if m:
+        return m.group(1)
     m = re.search(r"filename\s*=\s*([^;]+)", cd)
-    if m: return m.group(1).strip().strip('"')
+    if m:
+        return m.group(1).strip().strip('"')
     return None
 
 def classify(url: str, hint_img: bool=False) -> str:
-    if hint_img: return "png"
+    if hint_img:
+        return "png"
     try:
         r = SESSION.head(url, allow_redirects=True, timeout=TIMEOUT)
         if r.status_code >= 400 or not r.headers:
             r = SESSION.get(url, stream=True, allow_redirects=True, timeout=TIMEOUT)
         ct = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
         low = url.lower()
-        if ct in PNG_CT or low.endswith(".png") or ct.startswith("image/"): return "png"
-        if ct in ZIP_CT or low.endswith(".zip"): return "zip"
+        if ct in PNG_CT or low.endswith(".png") or ct.startswith("image/"):
+            return "png"
+        if ct in ZIP_CT or low.endswith(".zip"):
+            return "zip"
     except Exception as e:
         debug(f"classify error: {e!r}")
     return "other"
@@ -65,31 +95,25 @@ def dedup(seq: List[str]) -> List[str]:
 def build_label_map_md(text: str) -> Dict[str, str]:
     m = {}
     for label, url in MD_LINK_MAP_RE.findall(text):
-        if UA_URL_RE.fullmatch(url): m[url] = label.strip()
+        if UA_URL_RE.fullmatch(url):
+            m[url] = label.strip()
     return m
 
-def extract_from_body(body: str):
-    """
-    本文から UA URL を抽出。PNGヒントと、元の<img>タグ（あれば）を回収。
-    """
+def extract_from_text(text: str):
+    """任意テキストから UA URL と PNGヒント・<img>原文を抜く"""
     hits: List[Tuple[str, bool]] = []
     url_to_imgtag: Dict[str, str] = {}
 
-    # HTML <img ... src="UA_URL" ...>
-    for full_tag, url in HTML_IMG_TAG_RE.findall(body):
+    for full_tag, url in HTML_IMG_TAG_RE.findall(text):
         hits.append((url, True))
-        # URLごとの最新タグを保存（最後のを使う）
         url_to_imgtag[url] = full_tag
 
-    # Markdown image
-    for _, url in MD_IMAGE_MAP_RE.findall(body):
+    for _, url in MD_IMAGE_MAP_RE.findall(text):
         hits.append((url, True))
 
-    # プレーン/リンクのUA URL
-    for url in UA_URL_RE.findall(body):
+    for url in UA_URL_RE.findall(text):
         hits.append((url, False))
 
-    # 画像ヒントは集約
     merged: Dict[str, bool] = {}
     for url, hint in hits:
         merged[url] = merged.get(url, False) or hint
@@ -97,14 +121,13 @@ def extract_from_body(body: str):
     return [(u, merged[u]) for u in ordered], url_to_imgtag
 
 def render_png_line(url: str, imgtag_map: Dict[str, str]) -> str:
-    # 元HTMLを維持。Markdown画像にはしない（PNGはHTMLのみ）。
+    # PNGは必ずHTMLの <img …> を用いる
     if url in imgtag_map:
         return imgtag_map[url]
-    # 最低限のタグ（幅/高は持たない—GitHub側で調整される）
     return f'<img alt="Image" src="{url}" />'
 
 def render_zip_line(url: str, label: Optional[str]) -> str:
-    # ZIPはMarkdownリンクのみ。表示名は [xxx.zip](URL) の xxx.zip を最優先。
+    # ZIPはMarkdownリンクのみ、表示名は [xxx.zip](URL) の xxx.zip を最優先
     name = (label or "").strip()
     if not name:
         try:
@@ -112,65 +135,80 @@ def render_zip_line(url: str, label: Optional[str]) -> str:
             name = parse_cd(r.headers.get("Content-Disposition")) or ""
         except Exception:
             name = ""
-        if not name: name = guess_name_from_url(url)
-        if not name.lower().endswith(".zip"): name += ".zip"
+        if not name:
+            name = guess_name_from_url(url)
+        if not name.lower().endswith(".zip"):
+            name += ".zip"
     return f"[{name}]({url})"
-
-MARKER_PREFIX = "<!-- attachments-normalized:sha256="
-MARKER_RE = re.compile(r"<!--\s*attachments-normalized:sha256=([0-9a-f]{64})\s*-->")
-
-def strip_ua_fragments(body: str) -> str:
-    # UA関連の<img> / ![]() / []() / 素URL / 旧マーカーを除去
-    cleaned = HTML_IMG_TAG_RE.sub("", body)
-    cleaned = MD_IMAGE_MAP_RE.sub("", cleaned)
-    cleaned = MD_LINK_MAP_RE.sub(lambda m: "" if UA_URL_RE.fullmatch(m.group(2)) else m.group(0), cleaned)
-    cleaned = UA_URL_RE.sub("", cleaned)
-    cleaned = MARKER_RE.sub("", cleaned)
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned, flags=re.MULTILINE)
-    return cleaned.strip() + "\n"
 
 def compute_block_hash(png_urls: List[str], zip_urls: List[str]) -> str:
     blob = ("\n".join(png_urls) + "\n--\n" + "\n".join(zip_urls)).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()
 
-def normalize_issue_body(body: str) -> Optional[Tuple[str, str]]:
+def strip_ua_everywhere(text: str) -> str:
+    """本文全体から UA 関連断片と旧マーカーを除去（安全網）"""
+    cleaned = HTML_IMG_TAG_RE.sub("", text)
+    cleaned = MD_IMAGE_MAP_RE.sub("", cleaned)
+    cleaned = MD_LINK_MAP_RE.sub(lambda m: "" if UA_URL_RE.fullmatch(m.group(2)) else m.group(0), cleaned)
+    cleaned = UA_URL_RE.sub("", cleaned)
+    cleaned = MARKER_RE.sub("", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip() + "\n"
+
+def normalize_issue_body(body: str, comment_text: str = "") -> Optional[Tuple[str, str]]:
     """
-    戻り値: (new_body, normalized_hash) / 変更なしなら None
+    本文＋（あれば）コメントを合成して**一発**で整形。
+    - 先頭に既存のアタッチブロックがあれば丸ごと削除
+    - PNG群（HTML）→空行→ZIP群（MDリンク）→マーカー→空行→残本文
+    戻り値: (new_body, normalized_hash) / 変更無しなら None
     """
-    label_map = build_label_map_md(body)
-    ua_hits, imgtag_map = extract_from_body(body)
-    if not ua_hits: return None
+    # 1) 合成してから抽出（レース/二重実行に強い）
+    combined = (body.rstrip() + "\n\n" + (comment_text or "").rstrip() + "\n").lstrip()
+
+    # 2) 先頭に既存アタッチブロックがあればまず剥がす
+    combined = ATTACH_BLOCK_HEAD_RE.sub("", combined, count=1)
+
+    # 3) 抽出
+    label_map = build_label_map_md(combined)
+    hits, imgtag_map = extract_from_text(combined)
+    if not hits:
+        return None
 
     png_urls, zip_urls = [], []
-    for url, hint_img in ua_hits:
+    for url, hint_img in hits:
         kind = classify(url, hint_img)
-        if kind == "png": png_urls.append(url)
-        elif kind == "zip": zip_urls.append(url)
-        else: pass
+        if kind == "png":
+            png_urls.append(url)
+        elif kind == "zip":
+            zip_urls.append(url)
+        else:
+            pass
 
     png_urls, zip_urls = dedup(png_urls), dedup(zip_urls)
-    if not png_urls and not zip_urls: return None
+    if not png_urls and not zip_urls:
+        return None
 
-    # 先頭ブロック
+    # 4) 先頭ブロック生成
     lines: List[str] = []
     for u in png_urls:
         lines.append(render_png_line(u, imgtag_map))
     if png_urls and zip_urls:
-        lines.append("")  # PNG直下の空行（GitHubの描画バグ回避）
+        lines.append("")  # PNG直下の空行
     for u in zip_urls:
         lines.append(render_zip_line(u, label_map.get(u)))
-
-    # ブロックハッシュを隠しマーカーで付与
     block_hash = compute_block_hash(png_urls, zip_urls)
     lines.append(f"{MARKER_PREFIX}{block_hash} -->")
-    lines.append("")  # 添付ブロックと本文の区切り
+    lines.append("")  # 区切り
 
-    tail = strip_ua_fragments(body)
+    # 5) 本文から UA 断片を全削除して後段へ
+    tail = strip_ua_everywhere(combined)
     new_body = "\n".join(lines) + tail
 
-    # 冪等比較（末尾改行そろえ）
-    def _norm(x: str) -> str: return re.sub(r"\s+\Z", "", x.strip()) + "\n"
-    if _norm(new_body) == _norm(body): return None
+    # 6) 冪等比較（末尾改行統一）
+    def _norm(x: str) -> str:
+        return re.sub(r"\s+\Z", "", x.strip()) + "\n"
+    if _norm(new_body) == _norm(body):
+        return None
     return new_body, block_hash
 
 def github_update_issue(token: str, repo: str, number: int, new_body: str) -> bool:
@@ -191,50 +229,33 @@ def main():
     repo = os.environ.get("GITHUB_REPOSITORY")
     token = os.environ.get("GITHUB_TOKEN")
     if not (event_path and repo and token):
-        debug("missing env"); sys.exit(0)
+        debug("missing env")
+        sys.exit(0)
 
     ev = load_event(event_path)
     event_name = os.environ.get("GITHUB_EVENT_NAME") or ""
+
     issue = ev.get("issue") or {}
     number = issue.get("number")
-    if not number: debug("no issue"); sys.exit(0)
-    current_body = (issue.get("body") or "").rstrip() + "\n"
+    if not number:
+        debug("no issue")
+        sys.exit(0)
+    body = (issue.get("body") or "")
+
+    comment_text = ""
+    if event_name == "issue_comment":
+        comment_text = (ev.get("comment") or {}).get("body", "")
 
     updated, normalized_hash = False, ""
 
-    if event_name == "issue_comment":
-        # 本文をまずnormalize（直貼りの分も拾う）
-        res = normalize_issue_body(current_body)
-        if res:
-            new_body, h = res
-            if github_update_issue(token, repo, number, new_body):
-                updated, normalized_hash = True, h
-        else:
-            # コメントも混ぜて再normalize（コメント側のUAも取り込む）
-            composite = (current_body + "\n\n" + (ev.get("comment") or {}).get("body", "")).strip() + "\n"
-            res2 = normalize_issue_body(composite)
-            if res2:
-                new_body, h = res2
-                if github_update_issue(token, repo, number, new_body):
-                    updated, normalized_hash = True, h
-
-    elif event_name == "issues":
-        changes = ev.get("changes") or {}
-        if not changes.get("body"):
-            debug("edited w/o body change")
-        else:
-            res = normalize_issue_body(current_body)
-            if res:
-                new_body, h = res
-                if github_update_issue(token, repo, number, new_body):
-                    updated, normalized_hash = True, h
-            else:
-                debug("No normalization needed.")
-
+    res = normalize_issue_body(body, comment_text)
+    if res:
+        new_body, h = res
+        if github_update_issue(token, repo, number, new_body):
+            updated, normalized_hash = True, h
     else:
-        debug(f"Unsupported event: {event_name}")
+        debug("No normalization needed.")
 
-    # 出力
     out = os.environ.get("GITHUB_OUTPUT")
     if out:
         with open(out, "a", encoding="utf-8") as f:
