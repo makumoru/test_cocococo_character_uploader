@@ -46,16 +46,16 @@ def close_issue(repo: str, issue: str | int, token: str) -> None:
     r = requests.patch(url, json={"state": "closed"}, headers=_gh_headers(token), timeout=15)
     r.raise_for_status()
 
-def get_issue_body(token, repo, number):
+def _get_issue_body(token: str, repo: str, number: int) -> str:
     r = requests.get(
         f"https://api.github.com/repos/{repo}/issues/{number}",
         headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
         timeout=(5, 15),
     )
     r.raise_for_status()
-    return (r.json().get("body") or "")
+    return r.json().get("body") or ""
 
-def comment(token, repo, number, body):
+def _comment(token: str, repo: str, number: int, body: str):
     requests.post(
         f"https://api.github.com/repos/{repo}/issues/{number}/comments",
         headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
@@ -67,17 +67,15 @@ def main_gate_latest_only():
     token  = os.environ["GITHUB_TOKEN"]
     repo   = os.environ["GITHUB_REPOSITORY"]
     number = int(os.environ["ISSUE_NUMBER"])
-    want_hash = os.environ.get("NORMALIZED_HASH", "")
+    want   = (os.environ.get("NORMALIZED_HASH") or "").lower()
 
-    body = get_issue_body(token, repo, number)
-    m = MARKER_RE.search(body)
-    if want_hash and m and m.group(1).lower() != want_hash.lower():
-        # 自分は古い正規化結果に属する → スキップ
-        comment(token, repo, number,
-                f"> Skipped stale verification (newer normalization detected: `{m.group(1)[:8]}...` ≠ `{want_hash[:8]}...`).")
-        # 出力は success/exit0 で返し、finalizeに影響させない
-        print("verification_result=skipped", file=sys.stdout)
-        print("verification_exit_code=0", file=sys.stdout)
+    body = _get_issue_body(token, repo, number)
+    m = MARKER_RE.search(body or "")
+    if want and m and m.group(1).lower() != want:
+        _comment(token, repo, number,
+                 f"> Skipped stale verification (newer normalization detected: `{m.group(1)[:8]}…` ≠ `{want[:8]}…`).")
+        print("verification_result=skipped")
+        print("verification_exit_code=0")
         sys.exit(0)
 
 def remove_label(repo: str, issue: str | int, token: str, label: str) -> None:
@@ -492,3 +490,4 @@ def main() -> int:
 if __name__ == "__main__":
     main_gate_latest_only()
     sys.exit(main())
+
