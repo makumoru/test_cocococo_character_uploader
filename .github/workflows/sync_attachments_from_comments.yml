@@ -4,9 +4,10 @@ on:
   issue_comment:
     types: [created, edited]
   issues:
-    types: [edited]   # 本文編集
+    types: [edited]
+
 permissions:
-  contents: write     # repository_dispatch に必要
+  contents: write
   issues: write
 
 jobs:
@@ -39,7 +40,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           ISSUE=${{ steps.normalize.outputs.issue_number }}
+          HASH=${{ steps.normalize.outputs.normalized_hash }}
           api="https://api.github.com/repos/${{ github.repository }}/dispatches"
-          payload=$(jq -n --arg n "$ISSUE" '{event_type:"attachments-normalized", client_payload:{issue_number:($n|tonumber)}}')
+          payload=$(jq -n --arg n "$ISSUE" --arg h "$HASH" '{event_type:"attachments-normalized", client_payload:{issue_number:($n|tonumber), normalized_hash:$h}}')
           curl -sS -X POST -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
                "$api" -d "$payload"
