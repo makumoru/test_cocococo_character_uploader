@@ -219,7 +219,7 @@ def normalize_issue_body(body: str) -> Optional[str]:
     return new_body
 
 
-def github_update_issue(token: str, repo: str, number: int, new_body: str):
+def github_update_issue(token: str, repo: str, number: int, new_body: str) -> bool:
     url = f"{GH_API}/repos/{repo}/issues/{number}"
     resp = SESSION.patch(
         url,
@@ -231,6 +231,7 @@ def github_update_issue(token: str, repo: str, number: int, new_body: str):
         debug(f"Failed to update issue body: {resp.status_code} {resp.text}")
         sys.exit(1)
     debug("Issue body updated.")
+    return True
 
 
 def main():
@@ -253,42 +254,59 @@ def main():
 
     current_body = (issue.get("body") or "").rstrip() + "\n"
 
-    # パスA) issue_comment（既存のコメント由来パイプ）
+    updated = False
+
     if event_name == "issue_comment":
-        comment = ev.get("comment") or {}
-        comment_body = comment.get("body") or ""
-        # コメント内の UA を本文先頭へ持っていく（既存仕様と同等の整形）
-        # → まず本文側を normalize（直貼りも含めた最新SSOT化）
+        # 本文normalize → コメント混ぜて再normalize → 差分あれば更新
         new_body_via_body = normalize_issue_body(current_body)
         if new_body_via_body:
             current_body = new_body_via_body
-
-        # その上でコメント由来の UA を追加入力として再度 normalize
-        composite = (current_body + "\n\n" + comment_body).strip() + "\n"
+            updated = True
+        composite = (current_body + "\n\n" + (ev.get("comment") or {}).get("body", "")).strip() + "\n"
         new_body = normalize_issue_body(composite)
         if new_body:
-            github_update_issue(token, repo, number, new_body)
+            if github_update_issue(token, repo, number, new_body):
+                updated = True
+        # 出力へ
+        out = os.environ.get("GITHUB_OUTPUT")
+        if out:
+            with open(out, "a", encoding="utf-8") as f:
+                f.write(f"normalized={'changed' if updated else 'noop'}\n")
+                f.write(f"issue_number={number}\n")
         sys.exit(0)
 
-    # パスB) issues.edited（本文直貼りへの対応）
     if event_name == "issues":
-        # body の変更時のみ動けばよい（changes.body が無い編集は何もしない）
         changes = ev.get("changes") or {}
         if not changes.get("body"):
             debug("Issue edited but body not changed; skipping.")
+            out = os.environ.get("GITHUB_OUTPUT")
+            if out:
+                with open(out, "a", encoding="utf-8") as f:
+                    f.write("normalized=noop\n")
+                    f.write(f"issue_number={number}\n")
             sys.exit(0)
 
         new_body = normalize_issue_body(current_body)
         if new_body:
-            github_update_issue(token, repo, number, new_body)
+            if github_update_issue(token, repo, number, new_body):
+                updated = True
         else:
             debug("No normalization needed.")
+
+        out = os.environ.get("GITHUB_OUTPUT")
+        if out:
+            with open(out, "a", encoding="utf-8") as f:
+                f.write(f"normalized={'changed' if updated else 'noop'}\n")
+                f.write(f"issue_number={number}\n")
         sys.exit(0)
 
-    # それ以外のイベントでは何もしない
     debug(f"Unsupported event: {event_name}")
+    # 出力（保険）
+    out = os.environ.get("GITHUB_OUTPUT")
+    if out:
+        with open(out, "a", encoding="utf-8") as f:
+            f.write("normalized=noop\n")
     sys.exit(0)
-
 
 if __name__ == "__main__":
     main()
