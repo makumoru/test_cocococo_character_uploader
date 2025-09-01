@@ -14,6 +14,7 @@ from typing import List, Dict, Optional
 import requests
 import configparser
 from PIL import Image
+import time
 
 # ===== 定数 =====
 MAX_ZIP_SIZE_BYTES = 100 * 1024 * 1024
@@ -137,9 +138,43 @@ def _filename_from_url(url: str) -> str:
     path = urlparse(url).path
     return unquote(path.rsplit("/", 1)[-1]) if "/" in path else unquote(path)
 
+
+
+def _get_with_retry(url: str, stream: bool = True, timeout: int = 30, max_tries: int = 4) -> requests.Response:
+    """GitHub user-attachments が直後に 404 を返す揺らぎに備えてリトライする。
+    404, 429, 5xx を指数バックオフで数回だけ再試行。成功/その他の例外は従来通り。
+    変更点はこの関数の導入と、呼び出し元を _get_with_retry に差し替えた点のみ。"""
+    delay = 1.0
+    last_exc = None
+    for attempt in range(1, max_tries + 1):
+        try:
+            r = requests.get(url, stream=stream, timeout=timeout)
+            # 明示的に 404/429/5xx はリトライ対象
+            if r.status_code in (404, 429) or 500 <= r.status_code < 600:
+                last_exc = requests.HTTPError(f"{r.status_code} for url: {url}")
+                # 最終試行でなければ待って続行
+                if attempt < max_tries:
+                    time.sleep(delay)
+                    delay *= 2
+                    continue
+            r.raise_for_status()
+            return r
+        except requests.RequestException as e:
+            last_exc = e
+            if attempt < max_tries:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            raise
+    # 念のため
+    if last_exc:
+        raise last_exc
+    return r
+
+
 def _head(url: str) -> requests.Response:
     # HEAD を拒否する場合があるので GET(stream=True)
-    r = requests.get(url, stream=True, timeout=30)
+    r = _get_with_retry(url, stream=True, timeout=30)
     r.raise_for_status()
     return r
 
@@ -211,7 +246,7 @@ def enforce_attachment_policy(attachments: List[Dict[str, str]], env_zip_url: Op
 
 # ===== PNG 実体検査 =====
 def validate_thumbnail_png(url: str) -> None:
-    with requests.get(url, stream=True, timeout=30) as r:
+    with _get_with_retry(url, stream=True, timeout=30) as r:
         r.raise_for_status()
         content_length = int(r.headers.get("content-length", "0") or "0")
         if content_length and content_length > MAX_PNG_SIZE_BYTES:
@@ -342,7 +377,7 @@ def main() -> int:
 
         # ZIP 取得
         print(f"Downloading ZIP: {zip_url}")
-        with requests.get(zip_url, stream=True, timeout=30) as r:
+        with _get_with_retry(zip_url, stream=True, timeout=30) as r:
             r.raise_for_status()
             content_length = int(r.headers.get("content-length", "0") or "0")
             if content_length and content_length > MAX_ZIP_SIZE_BYTES:
