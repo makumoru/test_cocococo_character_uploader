@@ -61,6 +61,7 @@ ZIP_MD_RE = re.compile(
 
 VERIFIED_LABEL = "Verified ✅"  # verify.py が付与する想定のラベル名
 PLACEHOLDER_TEXT = "--検証に失敗したため本ファイルは削除しました--"
+COMMENT_PLACEHOLDER_TEXT = "--issue本文へ移動しました--"
 
 
 def _dedupe_preserve_order(items: List[str]) -> List[str]:
@@ -220,10 +221,9 @@ def main() -> int:
         # コメントに添付あり → コメントの添付を優先して本文に移動
         cleaned = _remove_occurrences(original_body, body_images + body_zips)
 
-        # 置き換え（本文に検証済み添付あり → 本文添付は捨ててコメント添付のみ）
+        # 本文にはコメント側の添付を移動
         images_block = _dedupe_preserve_order(comment_images)
         zips_block = _dedupe_preserve_order(comment_zips)
-
         top_block = _build_top_block(images_block, zips_block)
         candidate = (top_block + "\n\n" + cleaned) if top_block else cleaned
         if candidate.strip() != original_body.strip():
@@ -233,6 +233,17 @@ def main() -> int:
         if do_rewrite:
             print("Updating issue body (comment event) with reordered/moved attachments...")
             _patch_issue_body(issue_number, new_body)
+
+            # コメント本文側の添付をプレースホルダに置換
+            replaced_comment = comment_body
+            for s in comment_images + comment_zips:
+                replaced_comment = replaced_comment.replace(s, COMMENT_PLACEHOLDER_TEXT)
+            if replaced_comment.strip() != comment_body.strip():
+                comment_id = (payload.get("comment") or {}).get("id")
+                if comment_id:
+                    url = f"{GITHUB_API}/repos/{REPO}/issues/comments/{comment_id}"
+                    resp = SESSION.patch(url, json={"body": replaced_comment}, timeout=TIMEOUT)
+                    resp.raise_for_status()
 
         rc = _run_verify_py(issue_number)
         print(f"verify.py exited with code {rc}")
