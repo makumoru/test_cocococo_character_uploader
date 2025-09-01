@@ -139,11 +139,10 @@ def _filename_from_url(url: str) -> str:
     return unquote(path.rsplit("/", 1)[-1]) if "/" in path else unquote(path)
 
 
-
-def _get_with_retry(url: str, stream: bool = True, timeout: int = 30, max_tries: int = 4) -> requests.Response:
-    """GitHub user-attachments が直後に 404 を返す揺らぎに備えてリトライする。
-    404, 429, 5xx を指数バックオフで数回だけ再試行。成功/その他の例外は従来通り。
-    変更点はこの関数の導入と、呼び出し元を _get_with_retry に差し替えた点のみ。"""
+def _get_with_retry(url: str, stream: bool = True, timeout: int = 30, max_tries: int = 6) -> requests.Response:
+    """GitHub user-attachments が投稿直後に 404/429/5xx を返す揺らぎに備えて再試行する。
+    変更はこの関数の追加と、_head / PNG ダウンロード / ZIP ダウンロードの呼び出し元のみ。
+    それ以外の処理・コメントは一切変更しない。"""
     delay = 1.0
     last_exc = None
     for attempt in range(1, max_tries + 1):
@@ -152,10 +151,9 @@ def _get_with_retry(url: str, stream: bool = True, timeout: int = 30, max_tries:
             # 明示的に 404/429/5xx はリトライ対象
             if r.status_code in (404, 429) or 500 <= r.status_code < 600:
                 last_exc = requests.HTTPError(f"{r.status_code} for url: {url}")
-                # 最終試行でなければ待って続行
                 if attempt < max_tries:
                     time.sleep(delay)
-                    delay *= 2
+                    delay = min(delay * 2, 10.0)
                     continue
             r.raise_for_status()
             return r
@@ -163,14 +161,11 @@ def _get_with_retry(url: str, stream: bool = True, timeout: int = 30, max_tries:
             last_exc = e
             if attempt < max_tries:
                 time.sleep(delay)
-                delay *= 2
+                delay = min(delay * 2, 10.0)
                 continue
             raise
-    # 念のため
     if last_exc:
         raise last_exc
-    return r
-
 
 def _head(url: str) -> requests.Response:
     # HEAD を拒否する場合があるので GET(stream=True)
