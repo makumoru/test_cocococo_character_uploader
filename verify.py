@@ -498,7 +498,7 @@ def main() -> int:
                 labels_to_add.add("test3")
                 ini_path = (extract_root / ini_rel).resolve()
                 cp = configparser.ConfigParser(interpolation=None)
-                with open(ini_path, "r", encoding="utf-8", errors="ignore") as f:
+                with open(ini_path, "r", encoding="utf-8-sig", errors="ignore") as f:
                     cp.read_file(f)
 
                 print(f"DEBUG: Sections found in ini: {cp.sections()}")
