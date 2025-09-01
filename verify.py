@@ -332,7 +332,7 @@ def main() -> int:
             return 0
 
         # 許可・選定
-        zip_url = enforce_attachment_policy(attachments, env_zip_url)
+        zip_url = enforce_attachment_policy(attachments, zip_url_override)
 
         # PNG 実体検査（あれば）
         for a in attachments:
