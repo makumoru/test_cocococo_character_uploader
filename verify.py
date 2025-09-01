@@ -232,12 +232,10 @@ def parse_attachments(issue_body: str) -> List[Dict[str, str]]:
     return ats
 
 # ===== 添付ポリシー =====
-def enforce_attachment_policy(attachments: List[Dict[str, str]], env_zip_url: Optional[str]) -> str:
+def enforce_attachment_policy(attachments: List[Dict[str, str]], env_zip_url: Optional[str]) -> List[str]:
     """
     許可: ZIP と PNG のみ
-      - ZIP: ext=.zip または MIME が application/zip 相当
-      - PNG: MIME が image/png（assets は拡張子が無くてもOK）
-      - 'thumbnail.png' 名前チェックは、files/... でファイル名が見える場合のみ強制
+    変更点: 単一のURLではなく、見つかったすべてのZIPのURLリストを返す
     """
     if not attachments:
         raise RuntimeError("unreachable")
@@ -274,9 +272,9 @@ def enforce_attachment_policy(attachments: List[Dict[str, str]], env_zip_url: Op
     if env_zip_url:
         if not any(a["url"] == env_zip_url for a in zips):
             raise ValueError("指定された ZIP_URL が Issue の添付に含まれていません。")
-        return env_zip_url
+        return [env_zip_url]
 
-    return zips[0]["url"]
+    return [z["url"] for z in zips]
 
 # ===== PNG 実体検査 =====
 def validate_thumbnail_png(url: str) -> None:
@@ -393,209 +391,102 @@ def main() -> int:
         body = get_issue_body(repo, issue_number, github_token)
         attachments = parse_attachments(body)
 
-        # 添付なしはスキップ
         if not attachments:
             print("No attachments detected; skipping verification.")
-            set_output("verification_result", "skipped")
-            set_output("verification_exit_code", "0")
-            return 0
+            return 0 # 添付なしは正常スキップ
 
-        # 許可・選定
-        zip_url = enforce_attachment_policy(attachments, zip_url_override)
-
-        # PNG 実体検査（あれば）
+        # PNGと全てのZIPのURLを取得
         for a in attachments:
-            # MIME が image/png なら assets/UUID でも PNG として扱う
             if (a["ext"] == ".png") or (a["mime"] == "image/png"):
                 validate_thumbnail_png(a["url"])
+        
+        zip_urls = enforce_attachment_policy(attachments, zip_url_override)
 
-        # ZIP 取得
-        print(f"Downloading ZIP: {zip_url}")
-        with _get_with_retry(zip_url, stream=True, timeout=30) as r:
-            r.raise_for_status()
-            content_length = int(r.headers.get("content-length", "0") or "0")
-            if content_length and content_length > MAX_ZIP_SIZE_BYTES:
-                raise ValueError("ZIPサイズが上限(100MB)を超えています。")
-            data = r.content
-        if not data:
-            raise ValueError("ZIPを取得できませんでした。")
-        if len(data) > MAX_ZIP_SIZE_BYTES:
-            raise ValueError("ZIPサイズが上限(100MB)を超えています。（実体サイズ）")
+        # --- 全ZIP検証ループ ---
+        ini_labels_to_add = set() # character.iniから得たラベルを保持するセット
 
-        extract_root = Path("extracted").resolve()
-        extract_root.mkdir(parents=True, exist_ok=True)
+        for i, zip_url in enumerate(zip_urls):
+            print(f"\n--- Verifying ZIP {i+1}/{len(zip_urls)}: {Path(zip_url).name} ---")
+            
+            # ZIP 取得
+            with _get_with_retry(zip_url, stream=True, timeout=30) as r:
+                r.raise_for_status()
+                if len(r.content) > MAX_ZIP_SIZE_BYTES:
+                    raise ValueError("ZIPサイズが上限(100MB)を超えています。")
+                zip_data = r.content
 
-        with zipfile.ZipFile(BytesIO(data)) as zf:
-            validate_zip_members(zf, extract_root)
+            extract_root = Path(f"extracted_{i}").resolve()
+            extract_root.mkdir(parents=True, exist_ok=True)
 
-            # 署名検証（展開前）
-            try:
-                sig_data = json.loads(zf.read("signature.json").decode("utf-8"))
-            except KeyError:
-                raise ValueError("signature.json が見つかりません。")
+            with zipfile.ZipFile(BytesIO(zip_data)) as zf:
+                validate_zip_members(zf, extract_root)
+                sig_data = json.loads(zf.read("signature.json").decode("utf-8-sig"))
+                signature = sig_data.pop("signature")
+                normalized = normalize_json_for_signing(sig_data)
+                calc_sig = sha256_bytes((normalized + signature_salt).encode("utf-8"))
+                if calc_sig != signature:
+                    raise ValueError("署名が一致しません。")
 
-            if "signature" not in sig_data:
-                raise ValueError("signature.json に signature フィールドがありません。")
+                manifest = sig_data.get("file_manifest")
+                manifest_paths = list(manifest.keys()) if isinstance(manifest, dict) else []
+                zf.extractall(extract_root)
 
-            signature = sig_data.pop("signature")
-            normalized = normalize_json_for_signing(sig_data)
-            calc_sig = sha256_bytes((normalized + signature_salt).encode("utf-8"))
-            if calc_sig != signature:
-                raise ValueError("署名が一致しません。")
+            enforce_no_extra_files_fs(extract_root, manifest_paths)
 
-            manifest = sig_data.get("file_manifest")
-            if not manifest:
-                raise ValueError("file_manifest が空、または存在しません。")
+            for relpath, expected_sha in manifest.items():
+                file_path = (extract_root / relpath).resolve()
+                if not file_path.is_file():
+                    raise ValueError(f"マニフェスト記載ファイルが見つかりません: {pretty_name(relpath)}")
+                actual_sha = sha256_file(file_path)
+                if actual_sha != expected_sha:
+                    raise ValueError(f"ハッシュ不一致: {pretty_name(relpath)}")
+                verify_images_if_needed(extract_root, relpath)
 
-            manifest_paths: List[str] = []
-            if isinstance(manifest, dict):
-                manifest_paths = list(manifest.keys())
-            elif isinstance(manifest, list):
-                for item in manifest:
-                    if isinstance(item, dict) and "path" in item and "sha256" in item:
-                        manifest_paths.append(item["path"])
-            if not manifest_paths:
-                raise ValueError("file_manifest の形式が不正、または検証対象がありません。")
-
-            # 展開
-            zf.extractall(extract_root)
-
-        # 余分ファイルなし（完全一致）
-        enforce_no_extra_files_fs(extract_root, manifest_paths)
-
-        # ハッシュ照合
-        def _expected_sha(pth: str) -> Optional[str]:
-            if isinstance(manifest, dict):
-                return manifest.get(pth)
-            for item in manifest:
-                if isinstance(item, dict) and item.get("path") == pth:
-                    # --- 修正点: "sha2sha256" -> "sha256" ---
-                    return item.get("sha256")
-            return None
-
-        for relpath in manifest_paths:
-            file_path = (extract_root / relpath).resolve()
-            if not file_path.exists() or not file_path.is_file():
-                raise ValueError(f"マニフェスト記載ファイルが見つかりません: {pretty_name(relpath)}")
-            actual_sha = sha256_file(file_path)
-            expected_sha = _expected_sha(relpath)
-            if not expected_sha or actual_sha != expected_sha:
-                raise ValueError(f"ハッシュ不一致: {pretty_name(relpath)}")
-            verify_images_if_needed(extract_root, relpath)
-
-        # Step 1: これから適用するラベルを定義・収集する
-        labels_to_add = {"Verified ✅"}
-        labels_to_add.add("test1")
-        try:
-            ini_rel = None
-            for rp in manifest_paths:
-                # --- ★★★最重要修正点: .strip() を追加★★★ ---
-                if rp.strip().lower().endswith("character.ini"):
-                    ini_rel = rp.strip() # 空白除去後のパスを保存
-                    break
-            labels_to_add.add("test2")
+            # character.ini があれば解析してラベル情報を保存
+            ini_rel = next((p for p in manifest_paths if p.strip().lower().endswith("character.ini")), None)
             if ini_rel:
-                labels_to_add.add("test3")
-                ini_path = (extract_root / ini_rel).resolve()
+                print("Found character.ini in this ZIP.")
+                ini_path = (extract_root / ini_rel.strip()).resolve()
                 cp = configparser.ConfigParser(interpolation=None)
                 with open(ini_path, "r", encoding="utf-8-sig", errors="ignore") as f:
                     cp.read_file(f)
-
-                print(f"DEBUG: Sections found in ini: {cp.sections()}")
-
-                info_section_name = None
-                for section in cp.sections():
-                    if section.upper() == "INFO":
-                        info_section_name = section
-                        break
                 
-                labels_to_add.add("test4")
-                if info_section_name:
-                    labels_to_add.add("test5")
-                    print(f"DEBUG: 'INFO' section found as '{info_section_name}'")
-                    getv = lambda k: (cp.get(info_section_name, k, fallback="false") or "").strip().lower()
+                info_section = next((s for s in cp.sections() if s.upper() == "INFO"), None)
+                if info_section:
+                    getv = lambda k: (cp.get(info_section, k, fallback="false") or "").strip().lower()
                     if getv("IS_NSFW") in ("1", "true", "yes", "on"):
-                        labels_to_add.add("test6")
-                        labels_to_add.add("nsfw")
-                        print("DEBUG: 'nsfw' label will be added.")
+                        ini_labels_to_add.add("nsfw")
                     if getv("IS_DERIVATIVE") in ("1", "true", "yes", "on"):
-                        labels_to_add.add("derivative-work")
-                        print("DEBUG: 'derivative-work' label will be added.")
-                else:
-                    print("DEBUG: 'INFO' section was not found.")
-            else:
-                # デバッグ用に、iniが見つからなかった場合のmanifest_pathsを出力
-                print(f"DEBUG: character.ini not found in manifest paths: {manifest_paths}")
+                        ini_labels_to_add.add("derivative-work")
 
+        # --- 全てのZIP検証が成功した場合の最終処理 ---
+        print("\n--- All ZIPs verified successfully. Finalizing issue. ---")
+        
+        final_labels_to_add = {"Verified ✅"} | ini_labels_to_add
+        labels_to_remove = {"Invalid ❌", "pending"}
+        current_labels = set(get_issue_labels(repo, issue_number, github_token))
+        final_labels_set = (current_labels - labels_to_remove) | final_labels_to_add
+        final_labels_list = sorted(list(final_labels_set))
 
-        except Exception as e:
-            print(f"[warn] character.ini の解析中にエラーが発生: {e}")
+        if set(final_labels_list) != current_labels:
+            put_labels_full_with_retry(repo, issue_number, github_token, final_labels_list)
 
-        # Step 2: すべてのラベル操作を単一のAPIコールに集約して実行する
-        try:
-            labels_to_remove = {"Invalid ❌", "pending"}
-            current_labels = set(get_issue_labels(repo, issue_number, github_token))
-            
-            final_labels_set = (current_labels - labels_to_remove) | labels_to_add
-            final_labels_list = sorted(list(final_labels_set))
-
-            print(f"DEBUG: Current labels: {current_labels}")
-            print(f"DEBUG: Final labels to apply: {final_labels_list}")
-
-            if set(final_labels_list) != current_labels:
-                put_labels_full_with_retry(repo, issue_number, github_token, final_labels_list)
-                print("DEBUG: Labels updated via API.")
-            else:
-                print("DEBUG: No label changes needed.")
-                
-        except Exception as e:
-            print(f"[warn] ラベルの最終設定に失敗: {e}")
-
-        # Step 3: 成功コメントを投稿する
-        post_comment(repo, issue_number, github_token,
-                     "検証成功: 署名・マニフェスト完全一致・添付ポリシーの整合性を確認しました。")
-
-        set_output("verification_result", "success")
-        set_output("verification_exit_code", "0")
-        print("Verification succeeded.")
+        post_comment(repo, issue_number, github_token, f"{len(zip_urls)}個のZIPファイルの検証に成功しました。")
         return 0
 
     except Exception as e:
         reason = str(e) or e.__class__.__name__
         print(f"Verification failed with reason: {reason}")
-        try:
-            post_comment(repo, issue_number, github_token, f"検証失敗: {reason}")
-        except Exception as e2:
-            print(f"[warn] コメント投稿に失敗: {e2}")
-        try:
-            add_labels(repo, issue_number, github_token, ["Invalid ❌"])
-        except Exception as e2:
-            print(f"[warn] ラベル付与に失敗: {e2}")
-        try:
-            remove_label(repo, issue_number, github_token, "Verified ✅")
-        except Exception as e2:
-            print(f"[warn] Verifiedラベル削除に失敗: {e2}")
-        try:
-            remove_label(repo, issue_number, github_token, "pending")
-        except Exception as e2:
-            print(f"[warn] pendingラベル削除に失敗: {e2}")
-
-        # 本文から添付を無効化（置換）
-        try:
-            current = get_issue_body(repo, issue_number, github_token)
-            sanitized = sanitize_issue_body_on_failure(current)
-            if sanitized != current:
-                _patch_issue_body(repo, issue_number, github_token, sanitized)
-        except Exception as e2:
-            print(f"[warn] 本文サニタイズに失敗: {e2}")
-
-        try:
-            close_issue(repo, issue_number, github_token)
-        except Exception as e2:
-            print(f"[warn] Issueクローズに失敗: {e2}")
-
-        set_output("verification_result", "failure")
-        set_output("verification_exit_code", "1")
+        # 失敗時の処理
+        post_comment(repo, issue_number, github_token, f"検証失敗: {reason}")
+        add_labels(repo, issue_number, github_token, ["Invalid ❌"])
+        remove_label(repo, issue_number, github_token, "Verified ✅")
+        remove_label(repo, issue_number, github_token, "pending")
+        current_body = get_issue_body(repo, issue_number, github_token)
+        sanitized_body = sanitize_issue_body_on_failure(current_body)
+        if sanitized_body != current_body:
+            _patch_issue_body(repo, issue_number, github_token, sanitized_body)
+        close_issue(repo, issue_number, github_token)
         return 1
 
 if __name__ == "__main__":
