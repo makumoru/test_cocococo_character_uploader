@@ -40,10 +40,8 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_EVENT_NAME: ${{ github.event_name }}
           GITHUB_EVENT_PATH: ${{ github.event_path }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}   # ★ verify.py が直接読むため unify ステップでも注入
-          # もし使っていれば:
-          # SIGNATURE_SALT: ${{ secrets.SIGNATURE_SALT }}
-          # ZIP_URL: ${{ inputs.zip_url || '' }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          SIGNATURE_SALT: ${{ secrets.SIGNATURE_SALT }}   # ← 必ず有効行にする
         run: |
           set -euo pipefail
           set +e
