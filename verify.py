@@ -40,7 +40,21 @@ def add_labels(repo: str, issue: str | int, token: str, labels: List[str]) -> No
     r = requests.post(url, json={"labels": labels}, headers=_gh_headers(token), timeout=15)
     r.raise_for_status()
 
-# ラベル付与の堅牢化（404/409/422/5xx を短い指数バックオフで再試行）
+# --- 追加: 現在の Issue ラベル一覧を取得（最終確認用） ---
+def get_issue_labels(repo: str, issue: str | int, token: str) -> List[str]:
+    url = f"https://api.github.com/repos/{repo}/issues/{issue}"
+    r = requests.get(url, headers=_gh_headers(token), timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    labs = []
+    for it in data.get("labels", []):
+        if isinstance(it, dict) and "name" in it:
+            labs.append(it["name"])
+        elif isinstance(it, str):
+            labs.append(it)
+    return labs
+
+# --- 追加: ラベル付与の堅牢化（404/409/422/5xx を短い指数バックオフで再試行） ---
 def add_labels_with_retry(repo: str, issue: str | int, token: str, labels: List[str], max_tries: int = 5) -> None:
     url = f"https://api.github.com/repos/{repo}/issues/{issue}/labels"
     delay = 0.8
@@ -48,7 +62,6 @@ def add_labels_with_retry(repo: str, issue: str | int, token: str, labels: List[
     for i in range(1, max_tries + 1):
         try:
             r = requests.post(url, json={"labels": labels}, headers=_gh_headers(token), timeout=15)
-            # 422（ラベル作成・同期直後の揺らぎや、同名競合）、409（同時更新）、404（反映遅延）をリトライ対象に含める
             if r.status_code in (404, 409, 422) or 500 <= r.status_code < 600:
                 last = requests.HTTPError(f"{r.status_code} for {url}")
                 if i < max_tries:
@@ -483,15 +496,9 @@ def main() -> int:
                     cp.read_file(f)
                 nsfw = False
                 derivative = False
-                # セクション名は大小無視で INFO を検出
-                info_section = None
-                for sec in cp.sections():
-                    if sec.strip().casefold() == "info":
-                        info_section = sec
-                        break
-                if info_section:
+                if cp.has_section("INFO"):
                     # 文字列の大小無視で true を判定
-                    getv = lambda k: (cp.get(info_section, k, fallback="false") or "").strip().lower()
+                    getv = lambda k: (cp.get("INFO", k, fallback="false") or "").strip().lower()
                     nsfw = getv("IS_NSFW") in ("1","true","yes","on")
                     derivative = getv("IS_DERIVATIVE") in ("1","true","yes","on")
                 labels_to_add = []
@@ -501,8 +508,14 @@ def main() -> int:
                     labels_to_add.append("derivative-work")
                 if labels_to_add:
                     try:
-                        # ★変更：堅牢な付与呼び出し
+                        # まず付与を試みる
                         add_labels_with_retry(repo, issue_number, github_token, labels_to_add)
+                        # --- 追加: 付与後に最終確認し、不足があればもう一度だけ再付与 ---
+                        current = set(get_issue_labels(repo, issue_number, github_token))
+                        missing = [l for l in labels_to_add if l not in current]
+                        if missing:
+                            time.sleep(1.2)  # 反映遅延の吸収
+                            add_labels_with_retry(repo, issue_number, github_token, missing)
                     except Exception as e2:
                         print(f"[warn] ラベル付与に失敗: {labels_to_add}: {e2}")
         except Exception as e:
