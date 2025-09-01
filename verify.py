@@ -84,6 +84,41 @@ def normalize_json_for_signing(obj: dict) -> str:
     return json.dumps(obj, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
 
 # ===== 添付URL抽出 =====
+
+# ---- 失敗時の本文サニタイズ（添付無効化） ----
+PLACEHOLDER_TEXT = "--検証に失敗したため本ファイルは削除しました--"
+
+IMG_HTML_RE = re.compile(
+    r'<img[^>]*\bsrc=[\"\'](https://github\.com/user-attachments/(?:assets|files)/[^"\']+)[\"\'][^>]*>',
+    re.IGNORECASE
+)
+IMG_MD_RE = re.compile(
+    r'!\[[^\]]*?\]\(\s*(https://github\.com/user-attachments/(?:assets|files)/[^\s)]+)\s*\)',
+    re.IGNORECASE
+)
+ZIP_MD_RE = re.compile(
+    r'\[[^\]]+?\]\(\s*(https://github\.com/user-attachments/(?:files|assets)/[^\s)]+?\.zip)\s*\)',
+    re.IGNORECASE
+)
+
+def _patch_issue_body(repo: str, issue: str | int, token: str, new_body: str) -> None:
+    url = f"https://api.github.com/repos/{repo}/issues/{issue}"
+    r = requests.patch(url, json={"body": new_body}, headers=_gh_headers(token), timeout=15)
+    r.raise_for_status()
+
+def sanitize_issue_body_on_failure(body: str) -> str:
+    if not body:
+        return body
+    # 1) <img ... src="..."> を置換
+    body2 = IMG_HTML_RE.sub(PLACEHOLDER_TEXT, body)
+    # 2) Markdown画像
+    body2 = IMG_MD_RE.sub(PLACEHOLDER_TEXT, body2)
+    # 3) Markdown ZIPリンク
+    body2 = ZIP_MD_RE.sub(PLACEHOLDER_TEXT, body2)
+    # 4) 裸URL
+    body2 = ATTACH_RE.sub(PLACEHOLDER_TEXT, body2)
+    return body2
+
 ATTACH_RE = re.compile(
     r"https://github\.com/user-attachments/"
     r"(?:files/\d+/[^\s\)]+|assets/[0-9A-Za-z\-]+)"
@@ -274,16 +309,14 @@ def verify_images_if_needed(root: Path, relpath: str) -> None:
 
 # ===== メイン =====
 def main() -> int:
-    signature_salt = os.environ.get("SIGNATURE_SALT", "")
-    github_token = os.environ.get("GITHUB_TOKEN", "")
-    issue_number = os.environ.get("ISSUE_NUMBER", "")
-    repo = os.environ.get("GITHUB_REPOSITORY", "")
-    env_zip_url = os.environ.get("ZIP_URL", "") or None
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    issue_number = os.environ.get("ISSUE_NUMBER")
+    github_token = os.environ.get("GITHUB_TOKEN")
+    signature_salt = os.environ.get("SIGNATURE_SALT") or ""
+    zip_url_override = os.environ.get("ZIP_URL")
 
-    if not all([github_token, issue_number, repo]):
-        print("必要な環境変数が不足しています。GITHUB_TOKEN, ISSUE_NUMBER, GITHUB_REPOSITORY を確認してください。")
-        set_output("verification_result", "failure")
-        set_output("verification_exit_code", "1")
+    if not (repo and issue_number and github_token):
+        print("必要な環境変数が足りません。")
         return 1
 
     try:
@@ -451,6 +484,16 @@ def main() -> int:
             remove_label(repo, issue_number, github_token, "pending")
         except Exception as e2:
             print(f"[warn] pendingラベル削除に失敗: {e2}")
+
+        # 本文から添付を無効化（置換）
+        try:
+            current = get_issue_body(repo, issue_number, github_token)
+            sanitized = sanitize_issue_body_on_failure(current)
+            if sanitized != current:
+                _patch_issue_body(repo, issue_number, github_token, sanitized)
+        except Exception as e2:
+            print(f"[warn] 本文サニタイズに失敗: {e2}")
+
         try:
             close_issue(repo, issue_number, github_token)
         except Exception as e2:
