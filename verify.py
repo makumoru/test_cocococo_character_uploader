@@ -469,6 +469,7 @@ def main() -> int:
                 return manifest.get(pth)
             for item in manifest:
                 if isinstance(item, dict) and item.get("path") == pth:
+                    # --- 修正点: "sha2sha256" -> "sha256" ---
                     return item.get("sha256")
             return None
 
@@ -488,8 +489,9 @@ def main() -> int:
         try:
             ini_rel = None
             for rp in manifest_paths:
-                if rp.lower().endswith("character.ini"):
-                    ini_rel = rp
+                # --- ★★★最重要修正点: .strip() を追加★★★ ---
+                if rp.strip().lower().endswith("character.ini"):
+                    ini_rel = rp.strip() # 空白除去後のパスを保存
                     break
             labels_to_add.add("test2")
             if ini_rel:
@@ -499,7 +501,6 @@ def main() -> int:
                 with open(ini_path, "r", encoding="utf-8", errors="ignore") as f:
                     cp.read_file(f)
 
-                # デバッグ用: 読み込んだセクション名を出力
                 print(f"DEBUG: Sections found in ini: {cp.sections()}")
 
                 info_section_name = None
@@ -522,6 +523,10 @@ def main() -> int:
                         print("DEBUG: 'derivative-work' label will be added.")
                 else:
                     print("DEBUG: 'INFO' section was not found.")
+            else:
+                # デバッグ用に、iniが見つからなかった場合のmanifest_pathsを出力
+                print(f"DEBUG: character.ini not found in manifest paths: {manifest_paths}")
+
 
         except Exception as e:
             print(f"[warn] character.ini の解析中にエラーが発生: {e}")
