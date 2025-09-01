@@ -6,7 +6,6 @@ on:
   issue_comment:
     types: [created]
 
-# 同一Issue番号での並走を抑止
 concurrency:
   group: unified-attachments-${{ github.event.issue.number }}
   cancel-in-progress: false
@@ -34,6 +33,7 @@ jobs:
 
       - name: Run unified pipeline (reorder + verify)
         id: unify
+        continue-on-error: true   # ← verifyが1を返しても後続に進める
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_API_URL: https://api.github.com
@@ -41,11 +41,30 @@ jobs:
           GITHUB_EVENT_NAME: ${{ github.event_name }}
           GITHUB_EVENT_PATH: ${{ github.event_path }}
         run: |
+          set -euo pipefail
+          # 実行して終了コードを保持
+          set +e
           python unified_attachments_pipeline.py
+          rc=$?
+          set -e
+
+          echo "unified_exit_code=$rc"
+          # ここでステップ出力として明示
+          if [ "$rc" -eq 0 ]; then
+            echo "verification_result=success" >> "$GITHUB_OUTPUT"
+          elif [ "$rc" -eq 2 ]; then
+            # verify.py側でスキップ等があれば必要に応じて使う
+            echo "verification_result=skipped" >> "$GITHUB_OUTPUT"
+          else
+            echo "verification_result=failure" >> "$GITHUB_OUTPUT"
+          fi
+          echo "verification_exit_code=$rc" >> "$GITHUB_OUTPUT"
+
+          # continue-on-error:true なので、このステップ自体は成功扱いで後続へ
 
       - name: Finalize issue state
+        if: always()   # ← 先のステップが失敗でも必ず実行
         env:
-          # verify.py が $GITHUB_OUTPUT に書いた出力を受け取って finalize に渡す
           VERIFICATION_RESULT: ${{ steps.unify.outputs.verification_result }}
           VERIFICATION_EXIT_CODE: ${{ steps.unify.outputs.verification_exit_code }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
