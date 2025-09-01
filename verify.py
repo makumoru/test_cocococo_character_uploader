@@ -484,14 +484,16 @@ def main() -> int:
 
         # Step 1: これから適用するラベルを定義・収集する
         labels_to_add = {"Verified ✅"}
+        labels_to_add.add("test1")
         try:
             ini_rel = None
             for rp in manifest_paths:
                 if rp.lower().endswith("character.ini"):
                     ini_rel = rp
                     break
-            
+            labels_to_add.add("test2")
             if ini_rel:
+                labels_to_add.add("test13")
                 ini_path = (extract_root / ini_rel).resolve()
                 cp = configparser.ConfigParser(interpolation=None)
                 with open(ini_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -506,10 +508,13 @@ def main() -> int:
                         info_section_name = section
                         break
                 
+                labels_to_add.add("test4")
                 if info_section_name:
+                    labels_to_add.add("test5")
                     print(f"DEBUG: 'INFO' section found as '{info_section_name}'")
                     getv = lambda k: (cp.get(info_section_name, k, fallback="false") or "").strip().lower()
                     if getv("IS_NSFW") in ("1", "true", "yes", "on"):
+                        labels_to_add.add("test6")
                         labels_to_add.add("nsfw")
                         print("DEBUG: 'nsfw' label will be added.")
                     if getv("IS_DERIVATIVE") in ("1", "true", "yes", "on"):
