@@ -458,9 +458,15 @@ def main() -> int:
                     cp.read_file(f)
                 nsfw = False
                 derivative = False
-                if cp.has_section("INFO"):
+                # セクション名 "INFO" を大小無視で検出し、その実名を使って取得する
+                info_section = None
+                for sec in cp.sections():
+                    if sec.strip().casefold() == "info":
+                        info_section = sec
+                        break
+                if info_section:
                     # 文字列の大小無視で true を判定
-                    getv = lambda k: (cp.get("INFO", k, fallback="false") or "").strip().lower()
+                    getv = lambda k: (cp.get(info_section, k, fallback="false") or "").strip().lower()
                     nsfw = getv("IS_NSFW") in ("1","true","yes","on")
                     derivative = getv("IS_DERIVATIVE") in ("1","true","yes","on")
                 labels_to_add = []
