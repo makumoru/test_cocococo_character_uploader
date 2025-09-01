@@ -139,7 +139,12 @@ def _filename_from_url(url: str) -> str:
 
 def _head(url: str) -> requests.Response:
     # HEAD を拒否する場合があるので GET(stream=True)
-    r = requests.get(url, stream=True, timeout=30)
+    token = os.environ.get("GITHUB_TOKEN", "")
+    headers = _gh_headers(token)
+    # GitHub 側で UA が無いと弾かれるケースがあるため設定
+    if "User-Agent" not in headers:
+        headers["User-Agent"] = "unified-attachments-verify"
+    r = requests.get(url, stream=True, headers=headers, timeout=30)
     r.raise_for_status()
     return r
 
@@ -211,13 +216,16 @@ def enforce_attachment_policy(attachments: List[Dict[str, str]], env_zip_url: Op
 
 # ===== PNG 実体検査 =====
 def validate_thumbnail_png(url: str) -> None:
-    with requests.get(url, stream=True, timeout=30) as r:
+    token = os.environ.get("GITHUB_TOKEN", "")
+    headers = _gh_headers(token)
+    if "User-Agent" not in headers:
+        headers["User-Agent"] = "unified-attachments-verify"
+    with requests.get(url, stream=True, headers=headers, timeout=30) as r:
         r.raise_for_status()
         content_length = int(r.headers.get("content-length", "0") or "0")
         if content_length and content_length > MAX_PNG_SIZE_BYTES:
             raise ValueError("thumbnail.png のサイズが上限(10MB)を超えています。")
         data = r.content
-
     if not data:
         raise ValueError("thumbnail.png を取得できませんでした。")
     if len(data) > MAX_PNG_SIZE_BYTES:
@@ -309,14 +317,16 @@ def verify_images_if_needed(root: Path, relpath: str) -> None:
 
 # ===== メイン =====
 def main() -> int:
-    repo = os.environ.get("GITHUB_REPOSITORY")
-    issue_number = os.environ.get("ISSUE_NUMBER")
-    github_token = os.environ.get("GITHUB_TOKEN")
-    signature_salt = os.environ.get("SIGNATURE_SALT") or ""
-    zip_url_override = os.environ.get("ZIP_URL")
+    signature_salt = os.environ.get("SIGNATURE_SALT", "")
+    github_token = os.environ.get("GITHUB_TOKEN", "")
+    issue_number = os.environ.get("ISSUE_NUMBER", "")
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    env_zip_url = os.environ.get("ZIP_URL", "") or None
 
-    if not (repo and issue_number and github_token):
-        print("必要な環境変数が足りません。")
+    if not all([github_token, issue_number, repo]):
+        print("必要な環境変数が不足しています。GITHUB_TOKEN, ISSUE_NUMBER, GITHUB_REPOSITORY を確認してください。")
+        set_output("verification_result", "failure")
+        set_output("verification_exit_code", "1")
         return 1
 
     try:
@@ -332,17 +342,24 @@ def main() -> int:
             return 0
 
         # 許可・選定
-        zip_url = enforce_attachment_policy(attachments, zip_url_override)
+        zip_url = enforce_attachment_policy(attachments, env_zip_url)
 
         # PNG 実体検査（あれば）
         for a in attachments:
             # MIME が image/png なら assets/UUID でも PNG として扱う
             if (a["ext"] == ".png") or (a["mime"] == "image/png"):
+                # files/… の場合、ファイル名が見えるなら 'thumbnail.png' を厳密要求
+                if a["kind"] == "files" and a["ext"] == ".png":
+                    if a["filename"].lower() != "thumbnail.png":
+                        raise ValueError(f"PNG は 'thumbnail.png' のみ許可されます（不一致: {a['filename']}）。")
                 validate_thumbnail_png(a["url"])
 
-        # ZIP 取得
+        # ZIP 取得（※ Authorization / UA を必ず付与）
         print(f"Downloading ZIP: {zip_url}")
-        with requests.get(zip_url, stream=True, timeout=30) as r:
+        headers = _gh_headers(github_token)
+        if "User-Agent" not in headers:
+            headers["User-Agent"] = "unified-attachments-verify"
+        with requests.get(zip_url, stream=True, headers=headers, timeout=30) as r:
             r.raise_for_status()
             content_length = int(r.headers.get("content-length", "0") or "0")
             if content_length and content_length > MAX_ZIP_SIZE_BYTES:
@@ -367,7 +384,6 @@ def main() -> int:
 
             if "signature" not in sig_data:
                 raise ValueError("signature.json に signature フィールドがありません。")
-
             signature = sig_data.pop("signature")
             normalized = normalize_json_for_signing(sig_data)
             calc_sig = sha256_bytes((normalized + signature_salt).encode("utf-8"))
@@ -383,66 +399,60 @@ def main() -> int:
                 manifest_paths = list(manifest.keys())
             elif isinstance(manifest, list):
                 for item in manifest:
-                    if isinstance(item, dict) and "path" in item and "sha256" in item:
-                        manifest_paths.append(item["path"])
-            if not manifest_paths:
-                raise ValueError("file_manifest の形式が不正、または検証対象がありません。")
+                    p = item.get("path")
+                    if isinstance(p, str):
+                        manifest_paths.append(p)
+            else:
+                raise ValueError("file_manifest の形式が不正です。")
 
-            # 展開
-            zf.extractall(extract_root)
+            # 余分/不足なし（signature.json を除く）
+            zf_paths = [n for n in zf.namelist() if n != "signature.json"]
+            if set(zf_paths) != set(manifest_paths):
+                raise ValueError("ZIP 内のファイル集合が file_manifest と一致しません。")
 
-        # 余分ファイルなし（完全一致）
-        enforce_no_extra_files_fs(extract_root, manifest_paths)
+            # 各ファイルの SHA-256
+            for path in manifest_paths:
+                try:
+                    data_i = zf.read(path)
+                except KeyError:
+                    raise ValueError(f"ZIP 内に {path} が存在しません。")
+                h = sha256_bytes(data_i)
+                expected = manifest[path] if isinstance(manifest, dict) else next(
+                    (it.get("sha256") for it in manifest if it.get("path") == path), None
+                )
+                if not expected or h != expected:
+                    raise ValueError(f"{path} のハッシュが一致しません。")
 
-        # ハッシュ照合
-        def _expected_sha(pth: str) -> Optional[str]:
-            if isinstance(manifest, dict):
-                return manifest.get(pth)
-            for item in manifest:
-                if isinstance(item, dict) and item.get("path") == pth:
-                    return item.get("sha256")
-            return None
+                # 画像は必要に応じ Pillow で verify
+                ext = Path(path).suffix.lower()
+                if ext in IMAGE_EXTS:
+                    try:
+                        with Image.open(BytesIO(data_i)) as im:
+                            im.verify()
+                    except Exception:
+                        raise ValueError(f"{path} は壊れている可能性があります。")
 
-        for relpath in manifest_paths:
-            file_path = (extract_root / relpath).resolve()
-            if not file_path.exists() or not file_path.is_file():
-                raise ValueError(f"マニフェスト記載ファイルが見つかりません: {pretty_name(relpath)}")
-            actual_sha = sha256_file(file_path)
-            expected_sha = _expected_sha(relpath)
-            if not expected_sha or actual_sha != expected_sha:
-                raise ValueError(f"ハッシュ不一致: {pretty_name(relpath)}")
-            verify_images_if_needed(extract_root, relpath)
-
-        # character.ini を読んで派生/NSFWラベルを自動付与
+        # character.ini のラベル判定（任意）
         try:
-            ini_rel = None
-            for rp in manifest_paths:
-                if rp.lower().endswith("character.ini"):
-                    ini_rel = rp
-                    break
-            if ini_rel:
-                ini_path = (extract_root / ini_rel).resolve()
-                # 読み込み（INI内の奇妙なUnicodeも許容）
-                cp = configparser.ConfigParser()
-                with open(ini_path, "r", encoding="utf-8", errors="ignore") as f:
-                    cp.read_file(f)
-                nsfw = False
-                derivative = False
-                if cp.has_section("INFO"):
-                    # 文字列の大小無視で true を判定
-                    getv = lambda k: (cp.get("INFO", k, fallback="false") or "").strip().lower()
-                    nsfw = getv("IS_NSFW") in ("1","true","yes","on")
-                    derivative = getv("IS_DERIVATIVE") in ("1","true","yes","on")
+            ini_data = None
+            with zipfile.ZipFile(BytesIO(data)) as zf2:
+                try:
+                    ini_raw = zf2.read("character.ini")
+                    cp = configparser.ConfigParser()
+                    cp.read_string(ini_raw.decode("utf-8", errors="replace"))
+                    ini_data = cp
+                except KeyError:
+                    ini_data = None
+
+            if ini_data is not None:
                 labels_to_add = []
-                if nsfw:
+                is_true = lambda v: str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+                if ini_data.has_option("INFO", "IS_NSFW") and is_true(ini_data.get("INFO", "IS_NSFW")):
                     labels_to_add.append("nsfw")
-                if derivative:
+                if ini_data.has_option("INFO", "IS_DERIVATIVE") and is_true(ini_data.get("INFO", "IS_DERIVATIVE")):
                     labels_to_add.append("derivative-work")
                 if labels_to_add:
-                    try:
-                        add_labels(repo, issue_number, github_token, labels_to_add)
-                    except Exception as e2:
-                        print(f"[warn] ラベル付与に失敗: {labels_to_add}: {e2}")
+                    add_labels(repo, issue_number, github_token, labels_to_add)
         except Exception as e:
             print(f"[warn] character.ini の解析に失敗: {e}")
 
