@@ -40,6 +40,31 @@ def add_labels(repo: str, issue: str | int, token: str, labels: List[str]) -> No
     r = requests.post(url, json={"labels": labels}, headers=_gh_headers(token), timeout=15)
     r.raise_for_status()
 
+# ラベル付与の堅牢化（404/409/422/5xx を短い指数バックオフで再試行）
+def add_labels_with_retry(repo: str, issue: str | int, token: str, labels: List[str], max_tries: int = 5) -> None:
+    url = f"https://api.github.com/repos/{repo}/issues/{issue}/labels"
+    delay = 0.8
+    last = None
+    for i in range(1, max_tries + 1):
+        try:
+            r = requests.post(url, json={"labels": labels}, headers=_gh_headers(token), timeout=15)
+            # 422（ラベル作成・同期直後の揺らぎや、同名競合）、409（同時更新）、404（反映遅延）をリトライ対象に含める
+            if r.status_code in (404, 409, 422) or 500 <= r.status_code < 600:
+                last = requests.HTTPError(f"{r.status_code} for {url}")
+                if i < max_tries:
+                    time.sleep(delay)
+                    delay = min(delay * 1.7, 6.0)
+                    continue
+            r.raise_for_status()
+            return
+        except requests.RequestException as e:
+            last = e
+            if i < max_tries:
+                time.sleep(delay)
+                delay = min(delay * 1.7, 6.0)
+                continue
+            raise last
+
 def close_issue(repo: str, issue: str | int, token: str) -> None:
     url = f"https://api.github.com/repos/{repo}/issues/{issue}"
     r = requests.patch(url, json={"state": "closed"}, headers=_gh_headers(token), timeout=15)
@@ -458,7 +483,7 @@ def main() -> int:
                     cp.read_file(f)
                 nsfw = False
                 derivative = False
-                # セクション名 "INFO" を大小無視で検出し、その実名を使って取得する
+                # セクション名は大小無視で INFO を検出
                 info_section = None
                 for sec in cp.sections():
                     if sec.strip().casefold() == "info":
@@ -476,7 +501,8 @@ def main() -> int:
                     labels_to_add.append("derivative-work")
                 if labels_to_add:
                     try:
-                        add_labels(repo, issue_number, github_token, labels_to_add)
+                        # ★変更：堅牢な付与呼び出し
+                        add_labels_with_retry(repo, issue_number, github_token, labels_to_add)
                     except Exception as e2:
                         print(f"[warn] ラベル付与に失敗: {labels_to_add}: {e2}")
         except Exception as e:
