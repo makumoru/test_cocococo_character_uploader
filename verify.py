@@ -40,28 +40,41 @@ def add_labels(repo: str, issue: str | int, token: str, labels: List[str]) -> No
     r = requests.post(url, json={"labels": labels}, headers=_gh_headers(token), timeout=15)
     r.raise_for_status()
 
-# --- 追加: 現在の Issue ラベル一覧を取得（最終確認用） ---
+def close_issue(repo: str, issue: str | int, token: str) -> None:
+    url = f"https://api.github.com/repos/{repo}/issues/{issue}"
+    r = requests.patch(url, json={"state": "closed"}, headers=_gh_headers(token), timeout=15)
+    r.raise_for_status()
+
+def get_issue_body(repo: str, issue: str | int, token: str) -> str:
+    url = f"https://api.github.com/repos/{repo}/issues/{issue}"
+    r = requests.get(url, headers=_gh_headers(token), timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    return data.get("body") or ""
+
+# --- 追加: 現在の Issue ラベル一覧を取得 ---
 def get_issue_labels(repo: str, issue: str | int, token: str) -> List[str]:
     url = f"https://api.github.com/repos/{repo}/issues/{issue}"
     r = requests.get(url, headers=_gh_headers(token), timeout=15)
     r.raise_for_status()
     data = r.json()
-    labs = []
+    out = []
     for it in data.get("labels", []):
         if isinstance(it, dict) and "name" in it:
-            labs.append(it["name"])
+            out.append(it["name"])
         elif isinstance(it, str):
-            labs.append(it)
-    return labs
+            out.append(it)
+    return out
 
-# --- 追加: ラベル付与の堅牢化（404/409/422/5xx を短い指数バックオフで再試行） ---
-def add_labels_with_retry(repo: str, issue: str | int, token: str, labels: List[str], max_tries: int = 5) -> None:
+# --- 追加: ラベルの“最終状態”を PUT で一括反映（欠けていたら必ず付く） ---
+def put_labels_full_with_retry(repo: str, issue: str | int, token: str, final_label_set: List[str], max_tries: int = 5) -> None:
     url = f"https://api.github.com/repos/{repo}/issues/{issue}/labels"
     delay = 0.8
     last = None
     for i in range(1, max_tries + 1):
         try:
-            r = requests.post(url, json={"labels": labels}, headers=_gh_headers(token), timeout=15)
+            r = requests.put(url, json={"labels": final_label_set}, headers=_gh_headers(token), timeout=15)
+            # 一時的な 404/409/422 や 5xx はリトライ
             if r.status_code in (404, 409, 422) or 500 <= r.status_code < 600:
                 last = requests.HTTPError(f"{r.status_code} for {url}")
                 if i < max_tries:
@@ -77,18 +90,6 @@ def add_labels_with_retry(repo: str, issue: str | int, token: str, labels: List[
                 delay = min(delay * 1.7, 6.0)
                 continue
             raise last
-
-def close_issue(repo: str, issue: str | int, token: str) -> None:
-    url = f"https://api.github.com/repos/{repo}/issues/{issue}"
-    r = requests.patch(url, json={"state": "closed"}, headers=_gh_headers(token), timeout=15)
-    r.raise_for_status()
-
-def get_issue_body(repo: str, issue: str | int, token: str) -> str:
-    url = f"https://api.github.com/repos/{repo}/issues/{issue}"
-    r = requests.get(url, headers=_gh_headers(token), timeout=15)
-    r.raise_for_status()
-    data = r.json()
-    return data.get("body") or ""
 
 def remove_label(repo: str, issue: str | int, token: str, label: str) -> None:
     url = f"https://api.github.com/repos/{repo}/issues/{issue}/labels/{requests.utils.quote(label, safe='')}"
@@ -167,7 +168,7 @@ def _guess_filename_from_headers(r: requests.Response) -> Optional[str]:
     cd = r.headers.get("content-disposition") or r.headers.get("Content-Disposition")
     if not cd:
         return None
-    m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^\";]+)"?', cd, re.IGNORECASE)
+    m = re.compile(r'filename\*?=(?:UTF-8\'\')?"?([^\";]+)"?', re.IGNORECASE).search(cd)
     if not m:
         return None
     return unquote(m.group(1))
@@ -496,6 +497,7 @@ def main() -> int:
                     cp.read_file(f)
                 nsfw = False
                 derivative = False
+                # セクション名は大文字固定（アップローダ仕様）。必要なら大小無視に拡張可。
                 if cp.has_section("INFO"):
                     # 文字列の大小無視で true を判定
                     getv = lambda k: (cp.get("INFO", k, fallback="false") or "").strip().lower()
@@ -508,14 +510,11 @@ def main() -> int:
                     labels_to_add.append("derivative-work")
                 if labels_to_add:
                     try:
-                        # まず付与を試みる
-                        add_labels_with_retry(repo, issue_number, github_token, labels_to_add)
-                        # --- 追加: 付与後に最終確認し、不足があればもう一度だけ再付与 ---
-                        current = set(get_issue_labels(repo, issue_number, github_token))
-                        missing = [l for l in labels_to_add if l not in current]
-                        if missing:
-                            time.sleep(1.2)  # 反映遅延の吸収
-                            add_labels_with_retry(repo, issue_number, github_token, missing)
+                        # --- ここが変更点: “必ず付いた状態”を保証する ---
+                        current = get_issue_labels(repo, issue_number, github_token)
+                        final = sorted(set(current) | set(labels_to_add))
+                        if set(final) != set(current):
+                            put_labels_full_with_retry(repo, issue_number, github_token, final)
                     except Exception as e2:
                         print(f"[warn] ラベル付与に失敗: {labels_to_add}: {e2}")
         except Exception as e:
