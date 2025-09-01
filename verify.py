@@ -469,7 +469,7 @@ def main() -> int:
                 return manifest.get(pth)
             for item in manifest:
                 if isinstance(item, dict) and item.get("path") == pth:
-                    return item.get("sha2sha256")
+                    return item.get("sha256")
             return None
 
         for relpath in manifest_paths:
@@ -493,7 +493,7 @@ def main() -> int:
                     break
             labels_to_add.add("test2")
             if ini_rel:
-                labels_to_add.add("test13")
+                labels_to_add.add("test3")
                 ini_path = (extract_root / ini_rel).resolve()
                 cp = configparser.ConfigParser(interpolation=None)
                 with open(ini_path, "r", encoding="utf-8", errors="ignore") as f:
