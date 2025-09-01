@@ -60,6 +60,7 @@ ZIP_MD_RE = re.compile(
 )
 
 VERIFIED_LABEL = "Verified ✅"  # verify.py が付与する想定のラベル名
+PLACEHOLDER_TEXT = "--検証に失敗したため本ファイルは削除しました--"
 
 
 def _dedupe_preserve_order(items: List[str]) -> List[str]:
@@ -87,6 +88,9 @@ def _remove_occurrences(text: str, occurrences: List[str]) -> str:
     out = text
     for s in occurrences:
         out = out.replace(s, "")
+    # 失敗時サニタイズで挿入されたプレースホルダも、このタイミングで一緒に除去する
+    if PLACEHOLDER_TEXT in out:
+        out = out.replace(PLACEHOLDER_TEXT, "")
     return out.lstrip("\n")
 
 
