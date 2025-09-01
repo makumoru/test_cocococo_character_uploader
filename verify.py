@@ -521,19 +521,46 @@ def main() -> int:
             print(f"[warn] character.ini の解析に失敗: {e}")
 
         # 成功処理
-        add_labels(repo, issue_number, github_token, ["Verified ✅"])
+        # character.ini を読んで派生/NSFWラベルを判定
+        labels_to_add = {"Verified ✅"} # 検証成功ラベルを基本セットとする
         try:
-            remove_label(repo, issue_number, github_token, "Invalid ❌")
-        except Exception as e2:
-            print(f"[warn] Invalidラベル削除に失敗: {e2}")
-        try:
-            remove_label(repo, issue_number, github_token, "pending")
-        except Exception as e2:
-            print(f"[warn] pendingラベル削除に失敗: {e2}")
+            ini_rel = None
+            for rp in manifest_paths:
+                if rp.lower().endswith("character.ini"):
+                    ini_rel = rp
+                    break
+            if ini_rel:
+                ini_path = (extract_root / ini_rel).resolve()
+                cp = configparser.ConfigParser()
+                with open(ini_path, "r", encoding="utf-8", errors="ignore") as f:
+                    cp.read_file(f)
+                if cp.has_section("INFO"):
+                    getv = lambda k: (cp.get("INFO", k, fallback="false") or "").strip().lower()
+                    if getv("IS_NSFW") in ("1","true","yes","on"):
+                        labels_to_add.add("nsfw")
+                    if getv("IS_DERIVATIVE") in ("1","true","yes","on"):
+                        labels_to_add.add("derivative-work")
+        except Exception as e:
+            print(f"[warn] character.ini の解析に失敗: {e}")
 
+        # ラベルの状態を一度のAPIコールで確定させる
+        try:
+            labels_to_remove = {"Invalid ❌", "pending"}
+            current_labels = set(get_issue_labels(repo, issue_number, github_token))
+            
+            # 最終的なラベルセットを計算
+            final_labels = sorted((current_labels - labels_to_remove) | labels_to_add)
+
+            # 現在の状態と異なる場合のみAPIを呼び出す
+            if set(final_labels) != current_labels:
+                put_labels_full_with_retry(repo, issue_number, github_token, final_labels)
+        except Exception as e:
+            print(f"[warn] ラベルの最終設定に失敗: {e}")
+
+        # 成功コメントを投稿
         post_comment(repo, issue_number, github_token,
                      "検証成功: 署名・マニフェスト完全一致・添付ポリシーの整合性を確認しました。")
-
+        
         set_output("verification_result", "success")
         set_output("verification_exit_code", "0")
         print("Verification succeeded.")
