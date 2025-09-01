@@ -529,17 +529,27 @@ def main() -> int:
                 if rp.lower().endswith("character.ini"):
                     ini_rel = rp
                     break
+            
             if ini_rel:
                 ini_path = (extract_root / ini_rel).resolve()
                 cp = configparser.ConfigParser()
                 with open(ini_path, "r", encoding="utf-8", errors="ignore") as f:
                     cp.read_file(f)
-                if cp.has_section("INFO"):
-                    getv = lambda k: (cp.get("INFO", k, fallback="false") or "").strip().lower()
-                    if getv("IS_NSFW") in ("1","true","yes","on"):
+
+                # セクション名を大文字・小文字を区別せずに探す
+                info_section_name = None
+                for section in cp.sections():
+                    if section.upper() == "INFO":
+                        info_section_name = section
+                        break
+                
+                if info_section_name:
+                    getv = lambda k: (cp.get(info_section_name, k, fallback="false") or "").strip().lower()
+                    if getv("IS_NSFW") in ("1", "true", "yes", "on"):
                         labels_to_add.add("nsfw")
-                    if getv("IS_DERIVATIVE") in ("1","true","yes","on"):
+                    if getv("IS_DERIVATIVE") in ("1", "true", "yes", "on"):
                         labels_to_add.add("derivative-work")
+
         except Exception as e:
             print(f"[warn] character.ini の解析に失敗: {e}")
 
