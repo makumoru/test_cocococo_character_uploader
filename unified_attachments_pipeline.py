@@ -12,7 +12,7 @@
 - 本文に検証済み添付あり & コメントに添付なし → 何もしない（検証スキップ）
 - 本文に検証済み添付あり & コメントに添付あり → 本文の添付を削除し、コメントの添付を本文に移動（並べ替え）して検証
 - 本文に添付なし & コメントに添付なし → 何もしない（検証スキップ）
-- 本文に添付なし & コメントに添付あり → コメントの添付を本文に移動（並べ替え）して検証
+- 本文に添付なし & コメントに添付あり → コメントの添付を本文に移動（先頭、画像→ZIP）して検証
 
 重要: 画像は <img ... src="https://github.com/user-attachments/assets/..."> の元テキスト、
       ZIPは [表示名](https://github.com/user-attachments/files/.../default.zip) の元テキストを
@@ -59,7 +59,7 @@ ZIP_MD_RE = re.compile(
     re.IGNORECASE
 )
 
-VERIFIED_LABEL = "Verified ✅"  # verify.py が付けるラベル名を利用
+VERIFIED_LABEL = "Verified ✅"  # verify.py が付与する想定のラベル名
 
 
 def _dedupe_preserve_order(items: List[str]) -> List[str]:
@@ -109,7 +109,12 @@ def _patch_issue_body(issue_number: int, new_body: str) -> None:
     resp.raise_for_status()
 
 
-def _run_verify_py() -> int:
+def _run_verify_py(issue_number: int) -> int:
+    """
+    verify.py をサブプロセスで実行。
+    ここで不足しがちな環境変数（GITHUB_TOKEN / GITHUB_REPOSITORY / ISSUE_NUMBER）を
+    子プロセスの環境に注入してから実行する（保険）。
+    """
     candidates = [
         os.path.join(os.getcwd(), "verify.py"),
         os.path.join(os.path.dirname(__file__), "verify.py"),
@@ -118,7 +123,19 @@ def _run_verify_py() -> int:
     if not path:
         print("verify.py が見つからないため検証をスキップします。", file=sys.stderr)
         return 2
-    return subprocess.run([sys.executable, path], check=False).returncode
+
+    # 既存環境をコピーして必要キーを補完
+    child_env = os.environ.copy()
+    if "GITHUB_TOKEN" not in child_env and GITHUB_TOKEN:
+        child_env["GITHUB_TOKEN"] = GITHUB_TOKEN
+    if "GITHUB_REPOSITORY" not in child_env and REPO:
+        child_env["GITHUB_REPOSITORY"] = REPO
+    # ISSUE_NUMBER は verify.py が必須とするため、ここで確実に渡す
+    child_env["ISSUE_NUMBER"] = str(issue_number)
+
+    # そのほか SIGNATURE_SALT / ZIP_URL などは親環境にあればそのまま伝搬
+
+    return subprocess.run([sys.executable, path], check=False, env=child_env).returncode
 
 
 # === メイン =====================================================
@@ -179,8 +196,7 @@ def main() -> int:
                 print("Updating issue body (issues event) with reordered attachments...")
                 _patch_issue_body(issue_number, new_body)
 
-            # 本文に添付があるイベントなので検証実行
-            rc = _run_verify_py()
+            rc = _run_verify_py(issue_number)
             print(f"verify.py exited with code {rc}")
             return rc
 
@@ -197,19 +213,12 @@ def main() -> int:
                 print("Comment event: no attachments in comment and nothing requires re-verify -> skip.")
                 return 2
 
-        # コメントに添付あり
+        # コメントに添付あり → コメントの添付を優先して本文に移動
         cleaned = _remove_occurrences(original_body, body_images + body_zips)
 
-        if is_verified and (body_images or body_zips):
-            # 本文は検証済みの添付ありだが、今回コメントに添付あり → 本文側の添付は破棄し、
-            # コメント由来の添付だけで先頭ブロックを構成する（置き換え）
-            images_block = _dedupe_preserve_order(comment_images)
-            zips_block = _dedupe_preserve_order(comment_zips)
-        else:
-            # 置き換え要件でない場合でも、コメント優先で先頭に。
-            # ただし本文添付を残したい要件がない限り、今回の仕様では「コメントのみ」を採用。
-            images_block = _dedupe_preserve_order(comment_images)
-            zips_block = _dedupe_preserve_order(comment_zips)
+        # 置き換え（本文に検証済み添付あり → 本文添付は捨ててコメント添付のみ）
+        images_block = _dedupe_preserve_order(comment_images)
+        zips_block = _dedupe_preserve_order(comment_zips)
 
         top_block = _build_top_block(images_block, zips_block)
         candidate = (top_block + "\n\n" + cleaned) if top_block else cleaned
@@ -221,8 +230,7 @@ def main() -> int:
             print("Updating issue body (comment event) with reordered/moved attachments...")
             _patch_issue_body(issue_number, new_body)
 
-        # コメントに添付があるイベント → 必ず検証実行
-        rc = _run_verify_py()
+        rc = _run_verify_py(issue_number)
         print(f"verify.py exited with code {rc}")
         return rc
 
