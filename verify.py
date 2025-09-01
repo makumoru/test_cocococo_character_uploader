@@ -469,7 +469,7 @@ def main() -> int:
                 return manifest.get(pth)
             for item in manifest:
                 if isinstance(item, dict) and item.get("path") == pth:
-                    return item.get("sha256")
+                    return item.get("sha2sha256")
             return None
 
         for relpath in manifest_paths:
@@ -482,49 +482,7 @@ def main() -> int:
                 raise ValueError(f"ハッシュ不一致: {pretty_name(relpath)}")
             verify_images_if_needed(extract_root, relpath)
 
-        # character.ini を読んで派生/NSFWラベルを自動付与
-        try:
-            ini_rel = None
-            for rp in manifest_paths:
-                if rp.lower().endswith("character.ini"):
-                    ini_rel = rp
-                    break
-            if ini_rel:
-                ini_path = (extract_root / ini_rel).resolve()
-                # 読み込み（INI内の奇妙なUnicodeも許容）
-                cp = configparser.ConfigParser()
-                with open(ini_path, "r", encoding="utf-8", errors="ignore") as f:
-                    cp.read_file(f)
-                nsfw = False
-                derivative = False
-                # セクション名は大文字固定（アップローダ仕様）。必要なら大小無視に拡張可。
-                if cp.has_section("INFO"):
-                    # 文字列の大小無視で true を判定
-                    getv = lambda k: (cp.get("INFO", k, fallback="false") or "").strip().lower()
-                    nsfw = getv("IS_NSFW") in ("1","true","yes","on")
-                    derivative = getv("IS_DERIVATIVE") in ("1","true","yes","on")
-                labels_to_add = []
-                if nsfw:
-                    labels_to_add.append("nsfw")
-                    print("add nsfw")
-                if derivative:
-                    labels_to_add.append("derivative-work")
-                    print("add derivative")
-                if labels_to_add:
-                    try:
-                        # --- ここが変更点: “必ず付いた状態”を保証する ---
-                        current = get_issue_labels(repo, issue_number, github_token)
-                        final = sorted(set(current) | set(labels_to_add))
-                        print(labels_to_add)
-                        if set(final) != set(current):
-                            put_labels_full_with_retry(repo, issue_number, github_token, final)
-                    except Exception as e2:
-                        print(f"[warn] ラベル付与に失敗: {labels_to_add}: {e2}")
-        except Exception as e:
-            print(f"[warn] character.ini の解析に失敗: {e}")
-
-        # 成功処理
-        # character.ini を読んで派生/NSFWラベルを判定
+        # Step 1: これから適用するラベルを定義・収集する
         labels_to_add = {"Verified ✅"}
         try:
             ini_rel = None
@@ -535,9 +493,12 @@ def main() -> int:
             
             if ini_rel:
                 ini_path = (extract_root / ini_rel).resolve()
-                cp = configparser.ConfigParser(interpolation=None) # interpolationを無効化
+                cp = configparser.ConfigParser(interpolation=None)
                 with open(ini_path, "r", encoding="utf-8", errors="ignore") as f:
                     cp.read_file(f)
+
+                # デバッグ用: 読み込んだセクション名を出力
+                print(f"DEBUG: Sections found in ini: {cp.sections()}")
 
                 info_section_name = None
                 for section in cp.sections():
@@ -546,27 +507,36 @@ def main() -> int:
                         break
                 
                 if info_section_name:
-                    labels_to_add.add("nsfw")
+                    print(f"DEBUG: 'INFO' section found as '{info_section_name}'")
                     getv = lambda k: (cp.get(info_section_name, k, fallback="false") or "").strip().lower()
                     if getv("IS_NSFW") in ("1", "true", "yes", "on"):
                         labels_to_add.add("nsfw")
+                        print("DEBUG: 'nsfw' label will be added.")
                     if getv("IS_DERIVATIVE") in ("1", "true", "yes", "on"):
                         labels_to_add.add("derivative-work")
+                        print("DEBUG: 'derivative-work' label will be added.")
+                else:
+                    print("DEBUG: 'INFO' section was not found.")
+
         except Exception as e:
-            print(f"[warn] character.ini の解析に失敗: {e}")
+            print(f"[warn] character.ini の解析中にエラーが発生: {e}")
 
         # Step 2: すべてのラベル操作を単一のAPIコールに集約して実行する
         try:
             labels_to_remove = {"Invalid ❌", "pending"}
             current_labels = set(get_issue_labels(repo, issue_number, github_token))
             
-            # 現在のラベルから不要なものを削除し、追加すべきものをすべて結合する
             final_labels_set = (current_labels - labels_to_remove) | labels_to_add
             final_labels_list = sorted(list(final_labels_set))
 
-            # ラベルの状態が実際に変更される場合のみAPIを呼び出す
+            print(f"DEBUG: Current labels: {current_labels}")
+            print(f"DEBUG: Final labels to apply: {final_labels_list}")
+
             if set(final_labels_list) != current_labels:
                 put_labels_full_with_retry(repo, issue_number, github_token, final_labels_list)
+                print("DEBUG: Labels updated via API.")
+            else:
+                print("DEBUG: No label changes needed.")
                 
         except Exception as e:
             print(f"[warn] ラベルの最終設定に失敗: {e}")
