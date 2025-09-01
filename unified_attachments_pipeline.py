@@ -113,6 +113,14 @@ def _patch_issue_body(issue_number: int, new_body: str) -> None:
     resp.raise_for_status()
 
 
+def _patch_comment_body(comment_id: int, new_body: str) -> None:
+    if not GITHUB_TOKEN or not REPO:
+        raise RuntimeError("必要な環境変数が不足しています。GITHUB_TOKEN, GITHUB_REPOSITORY を確認してください。")
+    url = f"{GITHUB_API}/repos/{REPO}/issues/comments/{comment_id}"
+    resp = SESSION.patch(url, json={"body": new_body}, timeout=TIMEOUT)
+    resp.raise_for_status()
+
+
 def _run_verify_py(issue_number: int) -> int:
     """
     verify.py をサブプロセスで実行。
@@ -233,6 +241,20 @@ def main() -> int:
         if do_rewrite:
             print("Updating issue body (comment event) with reordered/moved attachments...")
             _patch_issue_body(issue_number, new_body)
+            # コメント側の元リンクを無効化（本文へ移動した旨のプレースホルダに差し替え）
+            try:
+                comment = payload.get("comment") or {}
+                comment_id = comment.get("id")
+                if comment_id and comment_body:
+                    replaced = comment_body
+                    for s in (comment_images + comment_zips):
+                        replaced = replaced.replace(s, "--issue本文に移動しました--")
+                    if replaced != comment_body:
+                        print("Patching original comment to invalidate moved links...")
+                        _patch_comment_body(int(comment_id), replaced)
+            except Exception as e:
+                print(f"Failed to patch original comment body: {e}", file=sys.stderr)
+
 
         rc = _run_verify_py(issue_number)
         print(f"verify.py exited with code {rc}")
