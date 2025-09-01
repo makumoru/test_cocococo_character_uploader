@@ -525,7 +525,7 @@ def main() -> int:
 
         # 成功処理
         # character.ini を読んで派生/NSFWラベルを判定
-        labels_to_add = {"Verified ✅"}
+        labels_to_add = {"Verified ✅","nsfw"}
         try:
             ini_rel = None
             for rp in manifest_paths:
