@@ -506,13 +506,16 @@ def main() -> int:
                 labels_to_add = []
                 if nsfw:
                     labels_to_add.append("nsfw")
+                    print("add nsfw")
                 if derivative:
                     labels_to_add.append("derivative-work")
+                    print("add derivative")
                 if labels_to_add:
                     try:
                         # --- ここが変更点: “必ず付いた状態”を保証する ---
                         current = get_issue_labels(repo, issue_number, github_token)
                         final = sorted(set(current) | set(labels_to_add))
+                        print(labels_to_add)
                         if set(final) != set(current):
                             put_labels_full_with_retry(repo, issue_number, github_token, final)
                     except Exception as e2:
@@ -522,7 +525,7 @@ def main() -> int:
 
         # 成功処理
         # character.ini を読んで派生/NSFWラベルを判定
-        labels_to_add = {"Verified ✅"} # 検証成功ラベルを基本セットとする
+        labels_to_add = {"Verified ✅"}
         try:
             ini_rel = None
             for rp in manifest_paths:
@@ -532,11 +535,10 @@ def main() -> int:
             
             if ini_rel:
                 ini_path = (extract_root / ini_rel).resolve()
-                cp = configparser.ConfigParser()
+                cp = configparser.ConfigParser(interpolation=None) # interpolationを無効化
                 with open(ini_path, "r", encoding="utf-8", errors="ignore") as f:
                     cp.read_file(f)
 
-                # セクション名を大文字・小文字を区別せずに探す
                 info_section_name = None
                 for section in cp.sections():
                     if section.upper() == "INFO":
@@ -549,28 +551,29 @@ def main() -> int:
                         labels_to_add.add("nsfw")
                     if getv("IS_DERIVATIVE") in ("1", "true", "yes", "on"):
                         labels_to_add.add("derivative-work")
-
         except Exception as e:
             print(f"[warn] character.ini の解析に失敗: {e}")
 
-        # ラベルの状態を一度のAPIコールで確定させる
+        # Step 2: すべてのラベル操作を単一のAPIコールに集約して実行する
         try:
             labels_to_remove = {"Invalid ❌", "pending"}
             current_labels = set(get_issue_labels(repo, issue_number, github_token))
             
-            # 最終的なラベルセットを計算
-            final_labels = sorted((current_labels - labels_to_remove) | labels_to_add)
+            # 現在のラベルから不要なものを削除し、追加すべきものをすべて結合する
+            final_labels_set = (current_labels - labels_to_remove) | labels_to_add
+            final_labels_list = sorted(list(final_labels_set))
 
-            # 現在の状態と異なる場合のみAPIを呼び出す
-            if set(final_labels) != current_labels:
-                put_labels_full_with_retry(repo, issue_number, github_token, final_labels)
+            # ラベルの状態が実際に変更される場合のみAPIを呼び出す
+            if set(final_labels_list) != current_labels:
+                put_labels_full_with_retry(repo, issue_number, github_token, final_labels_list)
+                
         except Exception as e:
             print(f"[warn] ラベルの最終設定に失敗: {e}")
 
-        # 成功コメントを投稿
+        # Step 3: 成功コメントを投稿する
         post_comment(repo, issue_number, github_token,
                      "検証成功: 署名・マニフェスト完全一致・添付ポリシーの整合性を確認しました。")
-        
+
         set_output("verification_result", "success")
         set_output("verification_exit_code", "0")
         print("Verification succeeded.")
